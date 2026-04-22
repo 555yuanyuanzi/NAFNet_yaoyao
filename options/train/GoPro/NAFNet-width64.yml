@@ -10,7 +10,7 @@ datasets:
   train:
     name: gopro-train
     type: PairedImageDataset
-    dataroot_gt: /home/young/yaoyao-workdir/polar/data/train/blur
+    dataroot_gt: /home/young/yaoyao-workdir/polar/data/train/sharp
     dataroot_lq: /home/young/yaoyao-workdir/polar/data/train/blur
 
     filename_tmpl: '{}'
