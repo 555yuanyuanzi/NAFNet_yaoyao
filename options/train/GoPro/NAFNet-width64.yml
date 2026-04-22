@@ -72,11 +72,6 @@ train:
     loss_weight: 1
     reduction: mean
 
-  freq_opt:
-    type: FrequencyLoss
-    loss_weight: 0.01
-    reduction: mean
-
 # validation settings
 val:
   val_freq: !!float 2e4
@@ -106,4 +101,3 @@ logger:
 dist_params:
   backend: nccl
   port: 29500
-
