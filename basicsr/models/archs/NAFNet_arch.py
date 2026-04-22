@@ -20,6 +20,7 @@ from basicsr.models.archs.arch_util import LayerNorm2d
 from basicsr.models.archs.local_arch import Local_Base
 from basicsr.models.GDPM import GlobalDirectionalPriorModulation
 from basicsr.models.PA import PatchAveraging
+from basicsr.models.dfpb import DualFrequencyProgressiveBlock
 
 class SimpleGate(nn.Module):
     def forward(self, x):
@@ -105,11 +106,14 @@ class NAFNet(nn.Module):
         middle_blk_num=1,
         enc_blk_nums=[],
         dec_blk_nums=[],
-        use_gdpm=True,
+        use_gdpm=False,
         gdpm_kwargs=None,
         use_pa=False,
         pa_patch_size=8,
         pa_stages=None,
+        use_dfpb=False,
+        dfpb_kwargs=None,
+        dfpb_stages=None,
     ):
         super().__init__()
 
@@ -132,6 +136,16 @@ class NAFNet(nn.Module):
         self.ups = nn.ModuleList()
         self.downs = nn.ModuleList()
         pa_stages = set(pa_stages or [])
+        dfpb_stages = set(dfpb_stages or [])
+        dfpb_kwargs = {} if dfpb_kwargs is None else dict(dfpb_kwargs)
+        self.dfpb_modules = nn.ModuleDict()
+
+        def register_dfpb(channels, stage_name):
+            if use_dfpb and stage_name in dfpb_stages:
+                self.dfpb_modules[stage_name] = DualFrequencyProgressiveBlock(
+                    channels=channels,
+                    **dfpb_kwargs,
+                )
 
         def build_block(channels, stage_name):
             return NAFBlock(
@@ -142,22 +156,26 @@ class NAFNet(nn.Module):
 
         chan = width
         for stage_idx, num in enumerate(enc_blk_nums, start=1):
+            stage_name = f'enc{stage_idx}'
             self.encoders.append(
                 nn.Sequential(
-                    *[build_block(chan, f'enc{stage_idx}') for _ in range(num)]
+                    *[build_block(chan, stage_name) for _ in range(num)]
                 )
             )
+            register_dfpb(chan, stage_name)
             self.downs.append(
                 nn.Conv2d(chan, 2*chan, 2, 2)
             )
             chan = chan * 2
 
+        register_dfpb(chan, 'middle')
         self.middle_blks = \
             nn.Sequential(
                 *[build_block(chan, 'middle') for _ in range(middle_blk_num)]
             )
 
         for stage_idx, num in enumerate(dec_blk_nums, start=1):
+            stage_name = f'dec{stage_idx}'
             self.ups.append(
                 nn.Sequential(
                     nn.Conv2d(chan, chan * 2, 1, bias=False),
@@ -167,11 +185,18 @@ class NAFNet(nn.Module):
             chan = chan // 2
             self.decoders.append(
                 nn.Sequential(
-                    *[build_block(chan, f'dec{stage_idx}') for _ in range(num)]
+                    *[build_block(chan, stage_name) for _ in range(num)]
                 )
             )
+            register_dfpb(chan, stage_name)
 
         self.padder_size = 2 ** len(self.encoders)
+
+    def _apply_dfpb(self, stage_name, x):
+        module = self.dfpb_modules.get(stage_name)
+        if module is None:
+            return x
+        return module(x)
 
     def forward(self, inp):
         B, C, H, W = inp.shape
@@ -183,17 +208,20 @@ class NAFNet(nn.Module):
 
         encs = []
 
-        for encoder, down in zip(self.encoders, self.downs):
+        for stage_idx, (encoder, down) in enumerate(zip(self.encoders, self.downs), start=1):
             x = encoder(x)
+            x = self._apply_dfpb(f'enc{stage_idx}', x)
             encs.append(x)
             x = down(x)
 
         x = self.middle_blks(x)
+        x = self._apply_dfpb('middle', x)
 
-        for decoder, up, enc_skip in zip(self.decoders, self.ups, encs[::-1]):
+        for stage_idx, (decoder, up, enc_skip) in enumerate(zip(self.decoders, self.ups, encs[::-1]), start=1):
             x = up(x)
             x = x + enc_skip
             x = decoder(x)
+            x = self._apply_dfpb(f'dec{stage_idx}', x)
 
         x = self.ending(x)
         x = x + inp
@@ -246,4 +274,3 @@ if __name__ == '__main__':
     macs = float(macs[:-4])
 
     print(macs, params)
-
