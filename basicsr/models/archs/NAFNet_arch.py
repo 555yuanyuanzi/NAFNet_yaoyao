@@ -19,14 +19,29 @@ import torch.nn.functional as F
 from basicsr.models.archs.arch_util import LayerNorm2d
 from basicsr.models.archs.local_arch import Local_Base
 from basicsr.models.GDPM import GlobalDirectionalPriorModulation
+from basicsr.models.PA import PatchAveraging
 
 class SimpleGate(nn.Module):
     def forward(self, x):
         x1, x2 = x.chunk(2, dim=1)
         return x1 * x2
 
+
+class PatchAwareGate(nn.Module):
+    def __init__(self, channels, patch_size=8):
+        super().__init__()
+        self.pa = PatchAveraging(patch_size=patch_size)
+        self.patch_size = patch_size
+        self.pa_scale = nn.Parameter(torch.zeros((1, channels, 1, 1)), requires_grad=True)
+
+    def forward(self, x):
+        x1, x2 = x.chunk(2, dim=1)
+        if x1.shape[-2] % self.patch_size == 0 and x1.shape[-1] % self.patch_size == 0:
+            x1 = x1 + self.pa_scale * self.pa(x1)
+        return x1 * x2
+
 class NAFBlock(nn.Module):
-    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0.):
+    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0., use_pa=False, pa_patch_size=8):
         super().__init__()
         dw_channel = c * DW_Expand
         self.conv1 = nn.Conv2d(in_channels=c, out_channels=dw_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
@@ -41,8 +56,8 @@ class NAFBlock(nn.Module):
                       groups=1, bias=True),
         )
 
-        # SimpleGate
-        self.sg = SimpleGate()
+        self.sg = PatchAwareGate(dw_channel // 2, patch_size=pa_patch_size) if use_pa else SimpleGate()
+        self.ffn_sg = SimpleGate()
 
         ffn_channel = FFN_Expand * c
         self.conv4 = nn.Conv2d(in_channels=c, out_channels=ffn_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
@@ -73,7 +88,7 @@ class NAFBlock(nn.Module):
         y = inp + x * self.beta
 
         x = self.conv4(self.norm2(y))
-        x = self.sg(x)
+        x = self.ffn_sg(x)
         x = self.conv5(x)
 
         x = self.dropout2(x)
@@ -92,6 +107,9 @@ class NAFNet(nn.Module):
         dec_blk_nums=[],
         use_gdpm=True,
         gdpm_kwargs=None,
+        use_pa=False,
+        pa_patch_size=8,
+        pa_stages=None,
     ):
         super().__init__()
 
@@ -113,12 +131,20 @@ class NAFNet(nn.Module):
         self.middle_blks = nn.ModuleList()
         self.ups = nn.ModuleList()
         self.downs = nn.ModuleList()
+        pa_stages = set(pa_stages or [])
+
+        def build_block(channels, stage_name):
+            return NAFBlock(
+                channels,
+                use_pa=use_pa and stage_name in pa_stages,
+                pa_patch_size=pa_patch_size,
+            )
 
         chan = width
-        for num in enc_blk_nums:
+        for stage_idx, num in enumerate(enc_blk_nums, start=1):
             self.encoders.append(
                 nn.Sequential(
-                    *[NAFBlock(chan) for _ in range(num)]
+                    *[build_block(chan, f'enc{stage_idx}') for _ in range(num)]
                 )
             )
             self.downs.append(
@@ -128,10 +154,10 @@ class NAFNet(nn.Module):
 
         self.middle_blks = \
             nn.Sequential(
-                *[NAFBlock(chan) for _ in range(middle_blk_num)]
+                *[build_block(chan, 'middle') for _ in range(middle_blk_num)]
             )
 
-        for num in dec_blk_nums:
+        for stage_idx, num in enumerate(dec_blk_nums, start=1):
             self.ups.append(
                 nn.Sequential(
                     nn.Conv2d(chan, chan * 2, 1, bias=False),
@@ -141,7 +167,7 @@ class NAFNet(nn.Module):
             chan = chan // 2
             self.decoders.append(
                 nn.Sequential(
-                    *[NAFBlock(chan) for _ in range(num)]
+                    *[build_block(chan, f'dec{stage_idx}') for _ in range(num)]
                 )
             )
 

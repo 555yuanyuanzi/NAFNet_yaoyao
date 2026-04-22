@@ -1,9 +1,4 @@
-﻿# ------------------------------------------------------------------------
-# Copyright (c) 2022 megvii-model. All Rights Reserved.
-# ------------------------------------------------------------------------
-# Modified from BasicSR (https://github.com/xinntao/BasicSR)
-# Copyright 2018-2020 BasicSR Authors
-# ------------------------------------------------------------------------
+﻿
 import importlib
 import torch
 import torch.nn.functional as F
@@ -380,42 +375,58 @@ class ImageRestorationModel(BaseModel):
         if rank == 0:
             pbar.close()
 
-        # current_metric = 0.
+        if not with_metrics:
+            return 0.
+
         collected_metrics = OrderedDict()
-        if with_metrics:
-            for metric in self.metric_results.keys():
-                collected_metrics[metric] = torch.tensor(self.metric_results[metric]).float().to(self.device)
-            collected_metrics['cnt'] = torch.tensor(cnt).float().to(self.device)
+        for metric in self.metric_results.keys():
+            collected_metrics[metric] = torch.tensor(self.metric_results[metric]).float().to(self.device)
+        collected_metrics['cnt'] = torch.tensor(cnt).float().to(self.device)
 
-            self.collected_metrics = collected_metrics
-        
-        keys = []
-        metrics = []
-        for name, value in self.collected_metrics.items():
-            keys.append(name)
-            metrics.append(value)
-        metrics = torch.stack(metrics, 0)
-        torch.distributed.reduce(metrics, dst=0)
-        if self.opt['rank'] == 0:
-            metrics_dict = {}
-            cnt = 0
-            for key, metric in zip(keys, metrics):
-                if key == 'cnt':
-                    cnt = float(metric)
-                    continue
-                metrics_dict[key] = float(metric)
+        if self.opt['dist']:
+            keys = []
+            metrics = []
+            for name, value in collected_metrics.items():
+                keys.append(name)
+                metrics.append(value)
+            metrics = torch.stack(metrics, 0)
+            torch.distributed.reduce(metrics, dst=0)
+            if self.opt['rank'] == 0:
+                metrics_dict = {}
+                cnt = 0
+                for key, metric in zip(keys, metrics):
+                    if key == 'cnt':
+                        cnt = float(metric)
+                        continue
+                    metrics_dict[key] = float(metric)
 
-            for key in metrics_dict:
-                metrics_dict[key] /= cnt
+                for key in metrics_dict:
+                    metrics_dict[key] /= cnt
 
-            self._log_validation_metric_values(current_iter, dataloader.dataset.opt['name'],
-                                               tb_logger, metrics_dict)
+                self._log_validation_metric_values(
+                    current_iter,
+                    dataloader.dataset.opt['name'],
+                    tb_logger,
+                    metrics_dict,
+                )
+            return 0.
+
+        metrics_dict = {}
+        sample_count = max(float(collected_metrics['cnt']), 1.0)
+        for key, metric in collected_metrics.items():
+            if key == 'cnt':
+                continue
+            metrics_dict[key] = float(metric) / sample_count
+        self._log_validation_metric_values(
+            current_iter,
+            dataloader.dataset.opt['name'],
+            tb_logger,
+            metrics_dict,
+        )
         return 0.
 
     def nondist_validation(self, *args, **kwargs):
-        logger = get_root_logger()
-        logger.warning('nondist_validation is not implemented. Run dist_validation.')
-        self.dist_validation(*args, **kwargs)
+        return self.dist_validation(*args, **kwargs)
 
 
     def _log_validation_metric_values(self, current_iter, dataset_name,
@@ -444,4 +455,3 @@ class ImageRestorationModel(BaseModel):
     def save(self, epoch, current_iter):
         self.save_network(self.net_g, 'net_g', current_iter)
         self.save_training_state(epoch, current_iter)
-
