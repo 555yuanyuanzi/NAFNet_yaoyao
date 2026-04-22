@@ -108,6 +108,7 @@ class GlobalDirectionalPriorModulation(nn.Module):
         self._cached_radius: torch.Tensor | None = None
         self._cached_dir_masks: torch.Tensor | None = None
         self._cached_radial_bins: torch.Tensor | None = None
+        self._last_prompt_stats: dict[str, torch.Tensor] = {}
 
     def _build_radius_map(self, size: int, device: torch.device) -> torch.Tensor:
         y = torch.linspace(-1.0, 1.0, steps=size, device=device, dtype=torch.float32)
@@ -306,6 +307,16 @@ class GlobalDirectionalPriorModulation(nn.Module):
         gamma = self.gamma_limit * torch.tanh(gamma)
         out = feat * (1.0 + self.scale * gamma)
 
+        direction_prior = aux["direction_prior"]
+        dir_gap = direction_prior.max(dim=1).values - direction_prior.min(dim=1).values
+        self._last_prompt_stats = {
+            "scale": self.scale.detach(),
+            "gamma_abs_mean": gamma.abs().mean().detach(),
+            "high_energy": aux["high_energy"].mean().detach(),
+            "high_minus_low": aux["high_minus_low"].mean().detach(),
+            "dir_gap": dir_gap.mean().detach(),
+        }
+
         if return_prior:
             aux["spectral_prior_raw"] = prior.detach()
             aux["spectral_prior_norm"] = prior_norm.detach()
@@ -314,3 +325,6 @@ class GlobalDirectionalPriorModulation(nn.Module):
             return out, aux
 
         return out
+
+    def get_last_prompt_stats(self) -> dict[str, torch.Tensor]:
+        return self._last_prompt_stats

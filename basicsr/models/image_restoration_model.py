@@ -245,8 +245,26 @@ class ImageRestorationModel(BaseModel):
             torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 0.01)
         self.optimizer_g.step()
 
+        loss_dict.update(self._collect_gdpm_log_dict())
 
         self.log_dict = self.reduce_loss_dict(loss_dict)
+
+    def _collect_gdpm_log_dict(self):
+        log_dict = OrderedDict()
+        net_g = self.get_bare_model(self.net_g)
+        gdpm = getattr(net_g, 'gdpm', None)
+        if gdpm is None or not hasattr(gdpm, 'get_last_prompt_stats'):
+            return log_dict
+
+        stats = gdpm.get_last_prompt_stats()
+        for name, value in stats.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            metric = value.detach()
+            if metric.numel() != 1:
+                metric = metric.mean()
+            log_dict[f'm_gdpm_{name}'] = metric
+        return log_dict
 
     def test(self):
         self.net_g.eval()
