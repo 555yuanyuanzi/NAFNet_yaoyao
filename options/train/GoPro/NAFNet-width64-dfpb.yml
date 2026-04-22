@@ -46,7 +46,7 @@ network_g:
   use_gdpm: false
   use_pa: false
   use_dfpb: true
-  dfpb_stages: [middle]
+  dfpb_stages: [enc4, middle]
   dfpb_kwargs:
     low_kernel_size: 5
     low_blocks: 1
