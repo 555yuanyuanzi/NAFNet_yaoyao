@@ -1,4 +1,4 @@
-# ------------------------------------------------------------------------
+﻿# ------------------------------------------------------------------------
 # Copyright (c) 2022 megvii-model. All Rights Reserved.
 # ------------------------------------------------------------------------
 
@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from basicsr.models.archs.arch_util import LayerNorm2d
 from basicsr.models.archs.local_arch import Local_Base
+from basicsr.models.GDPM import GlobalDirectionalPriorModulation
 
 class SimpleGate(nn.Module):
     def forward(self, x):
@@ -82,13 +83,30 @@ class NAFBlock(nn.Module):
 
 class NAFNet(nn.Module):
 
-    def __init__(self, img_channel=3, width=16, middle_blk_num=1, enc_blk_nums=[], dec_blk_nums=[]):
+    def __init__(
+        self,
+        img_channel=3,
+        width=16,
+        middle_blk_num=1,
+        enc_blk_nums=[],
+        dec_blk_nums=[],
+        use_gdpm=True,
+        gdpm_kwargs=None,
+    ):
         super().__init__()
 
         self.intro = nn.Conv2d(in_channels=img_channel, out_channels=width, kernel_size=3, padding=1, stride=1, groups=1,
                               bias=True)
         self.ending = nn.Conv2d(in_channels=width, out_channels=img_channel, kernel_size=3, padding=1, stride=1, groups=1,
                               bias=True)
+        self.gdpm = None
+        if use_gdpm:
+            gdpm_kwargs = {} if gdpm_kwargs is None else gdpm_kwargs
+            self.gdpm = GlobalDirectionalPriorModulation(
+                feat_channels=width,
+                in_channels=img_channel,
+                **gdpm_kwargs,
+            )
 
         self.encoders = nn.ModuleList()
         self.decoders = nn.ModuleList()
@@ -134,6 +152,8 @@ class NAFNet(nn.Module):
         inp = self.check_image_size(inp)
 
         x = self.intro(inp)
+        if self.gdpm is not None:
+            x = self.gdpm(inp, x)
 
         encs = []
 
@@ -200,3 +220,4 @@ if __name__ == '__main__':
     macs = float(macs[:-4])
 
     print(macs, params)
+

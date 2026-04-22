@@ -1,4 +1,4 @@
-# ------------------------------------------------------------------------
+﻿# ------------------------------------------------------------------------
 # Copyright (c) 2022 megvii-model. All Rights Reserved.
 # ------------------------------------------------------------------------
 # Modified from BasicSR (https://github.com/xinntao/BasicSR)
@@ -62,8 +62,15 @@ class ImageRestorationModel(BaseModel):
         else:
             self.cri_perceptual = None
 
-        if self.cri_pix is None and self.cri_perceptual is None:
-            raise ValueError('Both pixel and perceptual losses are None.')
+        if train_opt.get('freq_opt'):
+            freq_type = train_opt['freq_opt'].pop('type')
+            cri_freq_cls = getattr(loss_module, freq_type)
+            self.cri_freq = cri_freq_cls(**train_opt['freq_opt']).to(self.device)
+        else:
+            self.cri_freq = None
+
+        if self.cri_pix is None and self.cri_perceptual is None and self.cri_freq is None:
+            raise ValueError('Pixel, perceptual and frequency losses are all None.')
 
         # set up optimizers and schedulers
         self.setup_optimizers()
@@ -209,6 +216,14 @@ class ImageRestorationModel(BaseModel):
             # print('l pix ... ', l_pix)
             l_total += l_pix
             loss_dict['l_pix'] = l_pix
+
+        # frequency loss
+        if self.cri_freq:
+            l_freq = 0.
+            for pred in preds:
+                l_freq += self.cri_freq(pred, self.gt)
+            l_total += l_freq
+            loss_dict['l_freq'] = l_freq
 
         # perceptual loss
         if self.cri_perceptual:
@@ -411,3 +426,4 @@ class ImageRestorationModel(BaseModel):
     def save(self, epoch, current_iter):
         self.save_network(self.net_g, 'net_g', current_iter)
         self.save_training_state(epoch, current_iter)
+

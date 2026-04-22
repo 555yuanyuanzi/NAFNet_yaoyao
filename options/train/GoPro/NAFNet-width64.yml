@@ -1,26 +1,21 @@
-# ------------------------------------------------------------------------
-# Copyright (c) 2022 megvii-model. All Rights Reserved.
-# ------------------------------------------------------------------------
-# Modified from BasicSR (https://github.com/xinntao/BasicSR)
-# Copyright 2018-2020 BasicSR Authors
-# ------------------------------------------------------------------------
+﻿# python -m basicsr.train -opt options/train/GoPro/NAFNet-width64.yml --launcher none
 # general settings
 name: NAFNet-GoPro-width64
 model_type: ImageRestorationModel
 scale: 1
-num_gpu: 8
+num_gpu: 1
 manual_seed: 10
 
 datasets:
   train:
     name: gopro-train
     type: PairedImageDataset
-    dataroot_gt: ./datasets/GoPro/train/sharp_crops.lmdb
-    dataroot_lq: ./datasets/GoPro/train/blur_crops.lmdb
+    dataroot_gt: /home/young/yaoyao-workdir/polar/data/train/blur
+    dataroot_lq: /home/young/yaoyao-workdir/polar/data/train/blur
 
     filename_tmpl: '{}'
     io_backend:
-      type: lmdb
+      type: disk
 
     gt_size: 256
     use_flip: true
@@ -28,18 +23,18 @@ datasets:
 
     # data loader
     use_shuffle: true
-    num_worker_per_gpu: 8
-    batch_size_per_gpu: 8
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 4
     dataset_enlarge_ratio: 1
     prefetch_mode: ~
 
   val:
     name: gopro-test
     type: PairedImageDataset
-    dataroot_gt: ./datasets/GoPro/test/target.lmdb
-    dataroot_lq: ./datasets/GoPro/test/input.lmdb
+    dataroot_gt: /home/young/yaoyao-workdir/polar/data/test/sharp
+    dataroot_lq: /home/young/yaoyao-workdir/polar/data/test/blur
     io_backend:
-      type: lmdb
+      type: disk
 
 
 network_g:
@@ -77,6 +72,11 @@ train:
     loss_weight: 1
     reduction: mean
 
+  freq_opt:
+    type: FrequencyLoss
+    loss_weight: 0.01
+    reduction: mean
+
 # validation settings
 val:
   val_freq: !!float 2e4
@@ -106,3 +106,4 @@ logger:
 dist_params:
   backend: nccl
   port: 29500
+
