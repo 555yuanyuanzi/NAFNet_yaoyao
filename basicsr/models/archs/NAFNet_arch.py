@@ -20,6 +20,7 @@ from basicsr.models.archs.arch_util import LayerNorm2d
 from basicsr.models.archs.local_arch import Local_Base
 from basicsr.models.GDPM import GlobalDirectionalPriorModulation
 from basicsr.models.PA import PatchAveraging
+from basicsr.models.PSG import PatchStatisticsGate
 from basicsr.models.dfpb import DualFrequencyProgressiveBlock
 
 class SimpleGate(nn.Module):
@@ -42,8 +43,9 @@ class PatchAwareGate(nn.Module):
         return x1 * x2
 
 class NAFBlock(nn.Module):
-    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0., use_pa=False, pa_patch_size=8):
+    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0., use_pa=False, pa_patch_size=8, use_psg=False):
         super().__init__()
+
         dw_channel = c * DW_Expand
         self.conv1 = nn.Conv2d(in_channels=c, out_channels=dw_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
         self.conv2 = nn.Conv2d(in_channels=dw_channel, out_channels=dw_channel, kernel_size=3, padding=1, stride=1, groups=dw_channel,
@@ -57,9 +59,16 @@ class NAFBlock(nn.Module):
                       groups=1, bias=True),
         )
 
+        def build_gate(channels):
+            if use_psg:
+                return PatchStatisticsGate(channels, patch_size=pa_patch_size)
+            if use_pa:
+                return PatchAwareGate(channels, patch_size=pa_patch_size)
+            return SimpleGate()
+
         ffn_channel = FFN_Expand * c
-        self.sg = PatchAwareGate(dw_channel // 2, patch_size=pa_patch_size) if use_pa else SimpleGate()
-        self.ffn_sg = PatchAwareGate(ffn_channel // 2, patch_size=pa_patch_size) if use_pa else SimpleGate()
+        self.sg = build_gate(dw_channel // 2)
+        self.ffn_sg = build_gate(ffn_channel // 2)
 
         self.conv4 = nn.Conv2d(in_channels=c, out_channels=ffn_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
         self.conv5 = nn.Conv2d(in_channels=ffn_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
@@ -111,11 +120,16 @@ class NAFNet(nn.Module):
         use_pa=False,
         pa_patch_size=8,
         pa_stages=None,
+        use_psg=False,
+        psg_patch_size=8,
+        psg_stages=None,
         use_dfpb=False,
         dfpb_kwargs=None,
         dfpb_stages=None,
     ):
         super().__init__()
+        if use_pa and use_psg:
+            raise ValueError('use_pa and use_psg cannot be enabled at the same time.')
 
         self.intro = nn.Conv2d(in_channels=img_channel, out_channels=width, kernel_size=3, padding=1, stride=1, groups=1,
                               bias=True)
@@ -136,6 +150,7 @@ class NAFNet(nn.Module):
         self.ups = nn.ModuleList()
         self.downs = nn.ModuleList()
         pa_stages = set(pa_stages or [])
+        psg_stages = set(psg_stages or [])
         dfpb_stages = set(dfpb_stages or [])
         dfpb_kwargs = {} if dfpb_kwargs is None else dict(dfpb_kwargs)
         self.dfpb_modules = nn.ModuleDict()
@@ -148,10 +163,12 @@ class NAFNet(nn.Module):
                 )
 
         def build_block(channels, stage_name):
+            block_patch_size = psg_patch_size if use_psg and stage_name in psg_stages else pa_patch_size
             return NAFBlock(
                 channels,
                 use_pa=use_pa and stage_name in pa_stages,
-                pa_patch_size=pa_patch_size,
+                pa_patch_size=block_patch_size,
+                use_psg=use_psg and stage_name in psg_stages,
             )
 
         chan = width
@@ -193,10 +210,9 @@ class NAFNet(nn.Module):
         self.padder_size = 2 ** len(self.encoders)
 
     def _apply_dfpb(self, stage_name, x):
-        module = self.dfpb_modules.get(stage_name)
-        if module is None:
+        if stage_name not in self.dfpb_modules:
             return x
-        return module(x)
+        return self.dfpb_modules[stage_name](x)
 
     def forward(self, inp):
         B, C, H, W = inp.shape
