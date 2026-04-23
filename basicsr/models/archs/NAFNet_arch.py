@@ -57,10 +57,10 @@ class NAFBlock(nn.Module):
                       groups=1, bias=True),
         )
 
-        self.sg = PatchAwareGate(dw_channel // 2, patch_size=pa_patch_size) if use_pa else SimpleGate()
-        self.ffn_sg = SimpleGate()
-
         ffn_channel = FFN_Expand * c
+        self.sg = PatchAwareGate(dw_channel // 2, patch_size=pa_patch_size) if use_pa else SimpleGate()
+        self.ffn_sg = PatchAwareGate(ffn_channel // 2, patch_size=pa_patch_size) if use_pa else SimpleGate()
+
         self.conv4 = nn.Conv2d(in_channels=c, out_channels=ffn_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
         self.conv5 = nn.Conv2d(in_channels=ffn_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
 
