@@ -19,8 +19,8 @@ import torch.nn.functional as F
 from basicsr.models.archs.arch_util import LayerNorm2d
 from basicsr.models.archs.local_arch import Local_Base
 from basicsr.models.GDPM import GlobalDirectionalPriorModulation
+from basicsr.models.IPP import InterpolatedPatchPrior
 from basicsr.models.PA import PatchAveraging
-from basicsr.models.PSG import PatchStatisticsGate
 from basicsr.models.dfpb import DualFrequencyProgressiveBlock
 
 class SimpleGate(nn.Module):
@@ -42,8 +42,33 @@ class PatchAwareGate(nn.Module):
             x1 = x1 + self.pa_scale * self.pa(x1)
         return x1 * x2
 
+
+class IPPGate(nn.Module):
+    def __init__(self, channels, patch_size=8):
+        super().__init__()
+        self.ipp = InterpolatedPatchPrior(patch_size=patch_size)
+        self.patch_size = patch_size
+        self.ipp_scale = nn.Parameter(torch.zeros((1, channels, 1, 1)), requires_grad=True)
+
+    def forward(self, x):
+        x1, x2 = x.chunk(2, dim=1)
+        x1 = x1 + self.ipp_scale * self.ipp(x1)
+        return x1 * x2
+
+
 class NAFBlock(nn.Module):
-    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0., use_pa=False, pa_patch_size=8, use_psg=False):
+    def __init__(
+        self,
+        c,
+        DW_Expand=2,
+        FFN_Expand=2,
+        drop_out_rate=0.,
+        use_pa=False,
+        pa_patch_size=8,
+        use_ipp=False,
+        ipp_patch_size=8,
+        use_ipp_in_ffn=False,
+    ):
         super().__init__()
 
         dw_channel = c * DW_Expand
@@ -59,16 +84,16 @@ class NAFBlock(nn.Module):
                       groups=1, bias=True),
         )
 
-        def build_gate(channels):
-            if use_psg:
-                return PatchStatisticsGate(channels, patch_size=pa_patch_size)
+        def build_gate(channels, enable_ipp):
+            if enable_ipp:
+                return IPPGate(channels, patch_size=ipp_patch_size)
             if use_pa:
                 return PatchAwareGate(channels, patch_size=pa_patch_size)
             return SimpleGate()
 
         ffn_channel = FFN_Expand * c
-        self.sg = build_gate(dw_channel // 2)
-        self.ffn_sg = build_gate(ffn_channel // 2)
+        self.sg = build_gate(dw_channel // 2, use_ipp)
+        self.ffn_sg = build_gate(ffn_channel // 2, use_ipp and use_ipp_in_ffn)
 
         self.conv4 = nn.Conv2d(in_channels=c, out_channels=ffn_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
         self.conv5 = nn.Conv2d(in_channels=ffn_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
@@ -120,16 +145,17 @@ class NAFNet(nn.Module):
         use_pa=False,
         pa_patch_size=8,
         pa_stages=None,
-        use_psg=False,
-        psg_patch_size=8,
-        psg_stages=None,
+        use_ipp=False,
+        ipp_patch_size=8,
+        ipp_stages=None,
+        ipp_in_ffn=False,
         use_dfpb=False,
         dfpb_kwargs=None,
         dfpb_stages=None,
     ):
         super().__init__()
-        if use_pa and use_psg:
-            raise ValueError('use_pa and use_psg cannot be enabled at the same time.')
+        if use_pa and use_ipp:
+            raise ValueError('use_pa and use_ipp cannot be enabled at the same time.')
 
         self.intro = nn.Conv2d(in_channels=img_channel, out_channels=width, kernel_size=3, padding=1, stride=1, groups=1,
                               bias=True)
@@ -150,7 +176,7 @@ class NAFNet(nn.Module):
         self.ups = nn.ModuleList()
         self.downs = nn.ModuleList()
         pa_stages = set(pa_stages or [])
-        psg_stages = set(psg_stages or [])
+        ipp_stages = set(ipp_stages or [])
         dfpb_stages = set(dfpb_stages or [])
         dfpb_kwargs = {} if dfpb_kwargs is None else dict(dfpb_kwargs)
         self.dfpb_modules = nn.ModuleDict()
@@ -163,12 +189,15 @@ class NAFNet(nn.Module):
                 )
 
         def build_block(channels, stage_name):
-            block_patch_size = psg_patch_size if use_psg and stage_name in psg_stages else pa_patch_size
+            pa_active = use_pa and stage_name in pa_stages
+            ipp_active = use_ipp and stage_name in ipp_stages
             return NAFBlock(
                 channels,
-                use_pa=use_pa and stage_name in pa_stages,
-                pa_patch_size=block_patch_size,
-                use_psg=use_psg and stage_name in psg_stages,
+                use_pa=pa_active,
+                pa_patch_size=pa_patch_size,
+                use_ipp=ipp_active,
+                ipp_patch_size=ipp_patch_size,
+                use_ipp_in_ffn=ipp_in_ffn and ipp_active,
             )
 
         chan = width

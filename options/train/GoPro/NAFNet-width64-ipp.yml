@@ -1,6 +1,6 @@
-# python -m basicsr.train -opt options/train/GoPro/NAFNet-width64-psg.yml --launcher none
+# python -m basicsr.train -opt options/train/GoPro/NAFNet-width64-ipp.yml --launcher none
 # general settings
-name: NAFNet-GoPro-width64-PSG
+name: NAFNet-GoPro-width64-IPP
 model_type: ImageRestorationModel
 scale: 1
 num_gpu: 1
@@ -45,10 +45,11 @@ network_g:
   dec_blk_nums: [1, 1, 1, 1]
   use_gdpm: false
   use_pa: false
-  use_psg: true
+  use_ipp: true
   use_dfpb: false
-  psg_patch_size: 8
-  psg_stages: [enc1, enc2, enc3, enc4, middle, dec1, dec2, dec3, dec4]
+  ipp_patch_size: 8
+  ipp_in_ffn: false
+  ipp_stages: [enc1, enc2]
 
 # path
 path:
