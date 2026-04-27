@@ -33,13 +33,11 @@ class PatchAwareGate(nn.Module):
     def __init__(self, channels, patch_size=8):
         super().__init__()
         self.pa = PatchAveraging(patch_size=patch_size)
-        self.patch_size = patch_size
         self.pa_scale = nn.Parameter(torch.zeros((1, channels, 1, 1)), requires_grad=True)
 
     def forward(self, x):
         x1, x2 = x.chunk(2, dim=1)
-        if x1.shape[-2] % self.patch_size == 0 and x1.shape[-1] % self.patch_size == 0:
-            x1 = x1 + self.pa_scale * self.pa(x1)
+        x1 = x1 + self.pa_scale * self.pa(x1)
         return x1 * x2
 
 
