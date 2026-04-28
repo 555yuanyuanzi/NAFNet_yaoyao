@@ -21,7 +21,9 @@ from basicsr.models.archs.local_arch import Local_Base
 from basicsr.models.GDPM import GlobalDirectionalPriorModulation
 from basicsr.models.IPP import InterpolatedPatchPrior
 from basicsr.models.PA import PatchAveraging
+from basicsr.models.BASF import BlurAwareSkipFusion
 from basicsr.models.dfpb import DualFrequencyProgressiveBlock
+from basicsr.models.RMSA import RotaryMotionAwareSkipAlignment
 
 class SimpleGate(nn.Module):
     def forward(self, x):
@@ -150,6 +152,12 @@ class NAFNet(nn.Module):
         use_dfpb=False,
         dfpb_kwargs=None,
         dfpb_stages=None,
+        use_basf=False,
+        basf_kwargs=None,
+        basf_stages=None,
+        use_rmsa=False,
+        rmsa_kwargs=None,
+        rmsa_stages=None,
     ):
         super().__init__()
         if use_pa and use_ipp:
@@ -176,14 +184,34 @@ class NAFNet(nn.Module):
         pa_stages = set(pa_stages or [])
         ipp_stages = set(ipp_stages or [])
         dfpb_stages = set(dfpb_stages or [])
+        basf_stages = set(basf_stages or [])
+        rmsa_stages = set(rmsa_stages or [])
         dfpb_kwargs = {} if dfpb_kwargs is None else dict(dfpb_kwargs)
+        basf_kwargs = {} if basf_kwargs is None else dict(basf_kwargs)
+        rmsa_kwargs = {} if rmsa_kwargs is None else dict(rmsa_kwargs)
         self.dfpb_modules = nn.ModuleDict()
+        self.basf_modules = nn.ModuleDict()
+        self.rmsa_modules = nn.ModuleDict()
 
         def register_dfpb(channels, stage_name):
             if use_dfpb and stage_name in dfpb_stages:
                 self.dfpb_modules[stage_name] = DualFrequencyProgressiveBlock(
                     channels=channels,
                     **dfpb_kwargs,
+                )
+
+        def register_basf(channels, stage_name):
+            if use_basf and stage_name in basf_stages:
+                self.basf_modules[stage_name] = BlurAwareSkipFusion(
+                    channels=channels,
+                    **basf_kwargs,
+                )
+
+        def register_rmsa(channels, stage_name):
+            if use_rmsa and stage_name in rmsa_stages:
+                self.rmsa_modules[stage_name] = RotaryMotionAwareSkipAlignment(
+                    channels=channels,
+                    **rmsa_kwargs,
                 )
 
         def build_block(channels, stage_name):
@@ -232,6 +260,8 @@ class NAFNet(nn.Module):
                     *[build_block(chan, stage_name) for _ in range(num)]
                 )
             )
+            register_rmsa(chan, stage_name)
+            register_basf(chan, stage_name)
             register_dfpb(chan, stage_name)
 
         self.padder_size = 2 ** len(self.encoders)
@@ -240,6 +270,13 @@ class NAFNet(nn.Module):
         if stage_name not in self.dfpb_modules:
             return x
         return self.dfpb_modules[stage_name](x)
+
+    def _fuse_skip(self, stage_name, x_dec, x_skip):
+        if stage_name in self.rmsa_modules:
+            return self.rmsa_modules[stage_name](x_dec, x_skip)
+        if stage_name not in self.basf_modules:
+            return x_dec + x_skip
+        return self.basf_modules[stage_name](x_dec, x_skip)
 
     def forward(self, inp):
         B, C, H, W = inp.shape
@@ -261,10 +298,11 @@ class NAFNet(nn.Module):
         x = self._apply_dfpb('middle', x)
 
         for stage_idx, (decoder, up, enc_skip) in enumerate(zip(self.decoders, self.ups, encs[::-1]), start=1):
+            stage_name = f'dec{stage_idx}'
             x = up(x)
-            x = x + enc_skip
+            x = self._fuse_skip(stage_name, x, enc_skip)
             x = decoder(x)
-            x = self._apply_dfpb(f'dec{stage_idx}', x)
+            x = self._apply_dfpb(stage_name, x)
 
         x = self.ending(x)
         x = x + inp
