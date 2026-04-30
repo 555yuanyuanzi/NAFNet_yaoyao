@@ -1,6 +1,6 @@
-# python -m basicsr.train -opt options/train/GoPro/NAFNet-width64-dfpb.yml --launcher none
+# python -m basicsr.train -opt options/train/GoPro/NAFNet-width64-fftdfpb.yml --launcher none
 # general settings
-name: NAFNet-GoPro-width64-DFPB
+name: NAFNet-GoPro-width64-FFTDFPB
 model_type: ImageRestorationModel
 scale: 1
 num_gpu: 1
@@ -45,22 +45,14 @@ network_g:
   dec_blk_nums: [1, 1, 1, 1]
   use_gdpm: false
   use_pa: false
-  use_dfpb: true
-  dfpb_stages: [enc1, enc2, enc3, enc4]
-  dfpb_kwargs:
-    low_kernel_size: 5
+  use_dfpb: false
+  use_fftdfpb: true
+  fftdfpb_stages: [enc4]
+  fftdfpb_kwargs:
+    fft_radius_ratio: 0.23
     low_blocks: 1
     branch_expand_ratio: 2
     use_deformable_fusion: true
-    stage_kwargs:
-      enc1:
-        low_kernel_size: 9
-      enc2:
-        low_kernel_size: 7
-      enc3:
-        low_kernel_size: 5
-      enc4:
-        low_kernel_size: 5
 
 # path
 path:
