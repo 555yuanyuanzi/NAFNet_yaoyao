@@ -22,9 +22,9 @@ from basicsr.models.GDPM import GlobalDirectionalPriorModulation
 from basicsr.models.IPP import InterpolatedPatchPrior
 from basicsr.models.PA import PatchAveraging
 from basicsr.models.BASF import BlurAwareSkipFusion
-from basicsr.models.dfpb import DualFrequencyProgressiveBlock
+from basicsr.models.dfpb import DualFrequencyProgressiveBlock, FrequencyAwareBlock
 from basicsr.models.fftdfpb import FFTDualFrequencyProgressiveBlock
-from basicsr.models.wavedfpb import WaveletDualFrequencyProgressiveBlock
+from basicsr.models.wavedfpb import WaveletDualFrequencyProgressiveBlock, WaveletFrequencyAwareBlock
 from basicsr.models.RMSA import RotaryMotionAwareSkipAlignment
 
 class SimpleGate(nn.Module):
@@ -160,6 +160,12 @@ class NAFNet(nn.Module):
         use_wavedfpb=False,
         wavedfpb_kwargs=None,
         wavedfpb_stages=None,
+        use_layerwise_dfpb=False,
+        layerwise_dfpb_kwargs=None,
+        layerwise_dfpb_stages=None,
+        use_layerwise_wavedfpb=False,
+        layerwise_wavedfpb_kwargs=None,
+        layerwise_wavedfpb_stages=None,
         use_basf=False,
         basf_kwargs=None,
         basf_stages=None,
@@ -194,14 +200,22 @@ class NAFNet(nn.Module):
         dfpb_stages = set(dfpb_stages or [])
         fftdfpb_stages = set(fftdfpb_stages or [])
         wavedfpb_stages = set(wavedfpb_stages or [])
+        layerwise_dfpb_stages = set(layerwise_dfpb_stages or [])
+        layerwise_wavedfpb_stages = set(layerwise_wavedfpb_stages or [])
         basf_stages = set(basf_stages or [])
         rmsa_stages = set(rmsa_stages or [])
         dfpb_kwargs = {} if dfpb_kwargs is None else dict(dfpb_kwargs)
         fftdfpb_kwargs = {} if fftdfpb_kwargs is None else dict(fftdfpb_kwargs)
         wavedfpb_kwargs = {} if wavedfpb_kwargs is None else dict(wavedfpb_kwargs)
+        layerwise_dfpb_kwargs = {} if layerwise_dfpb_kwargs is None else dict(layerwise_dfpb_kwargs)
+        layerwise_wavedfpb_kwargs = {} if layerwise_wavedfpb_kwargs is None else dict(layerwise_wavedfpb_kwargs)
         dfpb_stage_kwargs = dfpb_kwargs.pop('stage_kwargs', {})
         fftdfpb_stage_kwargs = fftdfpb_kwargs.pop('stage_kwargs', {})
         wavedfpb_stage_kwargs = wavedfpb_kwargs.pop('stage_kwargs', {})
+        layerwise_dfpb_stage_kwargs = layerwise_dfpb_kwargs.pop('stage_kwargs', {})
+        layerwise_wavedfpb_stage_kwargs = layerwise_wavedfpb_kwargs.pop('stage_kwargs', {})
+        layerwise_dfpb_tier_map = layerwise_dfpb_kwargs.pop('tier_map', {})
+        layerwise_wavedfpb_tier_map = layerwise_wavedfpb_kwargs.pop('tier_map', {})
         basf_kwargs = {} if basf_kwargs is None else dict(basf_kwargs)
         rmsa_kwargs = {} if rmsa_kwargs is None else dict(rmsa_kwargs)
         if use_dfpb and use_fftdfpb and (dfpb_stages & fftdfpb_stages):
@@ -210,9 +224,25 @@ class NAFNet(nn.Module):
             raise ValueError('dfpb_stages and wavedfpb_stages cannot overlap when both blocks are enabled.')
         if use_fftdfpb and use_wavedfpb and (fftdfpb_stages & wavedfpb_stages):
             raise ValueError('fftdfpb_stages and wavedfpb_stages cannot overlap when both blocks are enabled.')
+        if use_layerwise_dfpb and use_dfpb and (layerwise_dfpb_stages & dfpb_stages):
+            raise ValueError('layerwise_dfpb_stages and dfpb_stages cannot overlap when both blocks are enabled.')
+        if use_layerwise_dfpb and use_fftdfpb and (layerwise_dfpb_stages & fftdfpb_stages):
+            raise ValueError('layerwise_dfpb_stages and fftdfpb_stages cannot overlap when both blocks are enabled.')
+        if use_layerwise_dfpb and use_wavedfpb and (layerwise_dfpb_stages & wavedfpb_stages):
+            raise ValueError('layerwise_dfpb_stages and wavedfpb_stages cannot overlap when both blocks are enabled.')
+        if use_layerwise_wavedfpb and use_dfpb and (layerwise_wavedfpb_stages & dfpb_stages):
+            raise ValueError('layerwise_wavedfpb_stages and dfpb_stages cannot overlap when both blocks are enabled.')
+        if use_layerwise_wavedfpb and use_fftdfpb and (layerwise_wavedfpb_stages & fftdfpb_stages):
+            raise ValueError('layerwise_wavedfpb_stages and fftdfpb_stages cannot overlap when both blocks are enabled.')
+        if use_layerwise_wavedfpb and use_wavedfpb and (layerwise_wavedfpb_stages & wavedfpb_stages):
+            raise ValueError('layerwise_wavedfpb_stages and wavedfpb_stages cannot overlap when both blocks are enabled.')
+        if use_layerwise_wavedfpb and use_layerwise_dfpb and (layerwise_wavedfpb_stages & layerwise_dfpb_stages):
+            raise ValueError('layerwise_wavedfpb_stages and layerwise_dfpb_stages cannot overlap when both blocks are enabled.')
         self.dfpb_modules = nn.ModuleDict()
         self.fftdfpb_modules = nn.ModuleDict()
         self.wavedfpb_modules = nn.ModuleDict()
+        self.layerwise_dfpb_modules = nn.ModuleDict()
+        self.layerwise_wavedfpb_modules = nn.ModuleDict()
         self.basf_modules = nn.ModuleDict()
         self.rmsa_modules = nn.ModuleDict()
 
@@ -240,6 +270,32 @@ class NAFNet(nn.Module):
                 kwargs.update(wavedfpb_stage_kwargs.get(stage_name, {}))
                 self.wavedfpb_modules[stage_name] = WaveletDualFrequencyProgressiveBlock(
                     channels=channels,
+                    **kwargs,
+                )
+
+        def register_layerwise_dfpb(channels, stage_name):
+            if use_layerwise_dfpb and stage_name in layerwise_dfpb_stages:
+                kwargs = dict(layerwise_dfpb_kwargs)
+                kwargs.update(layerwise_dfpb_stage_kwargs.get(stage_name, {}))
+                tier = kwargs.pop('tier', layerwise_dfpb_tier_map.get(stage_name, None))
+                if tier is None:
+                    raise ValueError(f'layerwise_dfpb tier is required for stage {stage_name}.')
+                self.layerwise_dfpb_modules[stage_name] = FrequencyAwareBlock(
+                    channels=channels,
+                    tier=int(tier),
+                    **kwargs,
+                )
+
+        def register_layerwise_wavedfpb(channels, stage_name):
+            if use_layerwise_wavedfpb and stage_name in layerwise_wavedfpb_stages:
+                kwargs = dict(layerwise_wavedfpb_kwargs)
+                kwargs.update(layerwise_wavedfpb_stage_kwargs.get(stage_name, {}))
+                tier = kwargs.pop('tier', layerwise_wavedfpb_tier_map.get(stage_name, None))
+                if tier is None:
+                    raise ValueError(f'layerwise_wavedfpb tier is required for stage {stage_name}.')
+                self.layerwise_wavedfpb_modules[stage_name] = WaveletFrequencyAwareBlock(
+                    channels=channels,
+                    tier=int(tier),
                     **kwargs,
                 )
 
@@ -280,6 +336,8 @@ class NAFNet(nn.Module):
             register_dfpb(chan, stage_name)
             register_fftdfpb(chan, stage_name)
             register_wavedfpb(chan, stage_name)
+            register_layerwise_dfpb(chan, stage_name)
+            register_layerwise_wavedfpb(chan, stage_name)
             self.downs.append(
                 nn.Conv2d(chan, 2*chan, 2, 2)
             )
@@ -288,6 +346,8 @@ class NAFNet(nn.Module):
         register_dfpb(chan, 'middle')
         register_fftdfpb(chan, 'middle')
         register_wavedfpb(chan, 'middle')
+        register_layerwise_dfpb(chan, 'middle')
+        register_layerwise_wavedfpb(chan, 'middle')
         self.middle_blks = \
             nn.Sequential(
                 *[build_block(chan, 'middle') for _ in range(middle_blk_num)]
@@ -312,6 +372,8 @@ class NAFNet(nn.Module):
             register_dfpb(chan, stage_name)
             register_fftdfpb(chan, stage_name)
             register_wavedfpb(chan, stage_name)
+            register_layerwise_dfpb(chan, stage_name)
+            register_layerwise_wavedfpb(chan, stage_name)
 
         self.padder_size = 2 ** len(self.encoders)
 
@@ -329,6 +391,16 @@ class NAFNet(nn.Module):
         if stage_name not in self.wavedfpb_modules:
             return x
         return self.wavedfpb_modules[stage_name](x)
+
+    def _apply_layerwise_dfpb(self, stage_name, x):
+        if stage_name not in self.layerwise_dfpb_modules:
+            return x
+        return self.layerwise_dfpb_modules[stage_name](x)
+
+    def _apply_layerwise_wavedfpb(self, stage_name, x):
+        if stage_name not in self.layerwise_wavedfpb_modules:
+            return x
+        return self.layerwise_wavedfpb_modules[stage_name](x)
 
     def _fuse_skip(self, stage_name, x_dec, x_skip):
         if stage_name in self.rmsa_modules:
@@ -352,6 +424,8 @@ class NAFNet(nn.Module):
             x = self._apply_dfpb(f'enc{stage_idx}', x)
             x = self._apply_fftdfpb(f'enc{stage_idx}', x)
             x = self._apply_wavedfpb(f'enc{stage_idx}', x)
+            x = self._apply_layerwise_dfpb(f'enc{stage_idx}', x)
+            x = self._apply_layerwise_wavedfpb(f'enc{stage_idx}', x)
             encs.append(x)
             x = down(x)
 
@@ -359,6 +433,8 @@ class NAFNet(nn.Module):
         x = self._apply_dfpb('middle', x)
         x = self._apply_fftdfpb('middle', x)
         x = self._apply_wavedfpb('middle', x)
+        x = self._apply_layerwise_dfpb('middle', x)
+        x = self._apply_layerwise_wavedfpb('middle', x)
 
         for stage_idx, (decoder, up, enc_skip) in enumerate(zip(self.decoders, self.ups, encs[::-1]), start=1):
             stage_name = f'dec{stage_idx}'
@@ -368,6 +444,8 @@ class NAFNet(nn.Module):
             x = self._apply_dfpb(stage_name, x)
             x = self._apply_fftdfpb(stage_name, x)
             x = self._apply_wavedfpb(stage_name, x)
+            x = self._apply_layerwise_dfpb(stage_name, x)
+            x = self._apply_layerwise_wavedfpb(stage_name, x)
 
         x = self.ending(x)
         x = x + inp

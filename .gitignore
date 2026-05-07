@@ -7,3 +7,8 @@ logs/
 *.sh
 datasets
 basicsr.egg-info
+
+# Local deployment/export assets
+rdk_x5/
+scripts/
+

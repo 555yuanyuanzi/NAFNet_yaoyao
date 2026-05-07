@@ -193,20 +193,25 @@ class ConditionedDeformableConv2d(nn.Module):
         self.bias = nn.Parameter(torch.zeros(channels))
         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
 
-        self.offset_mask = nn.Conv2d(
-            condition_channels,
-            3 * kernel_size * kernel_size,
-            kernel_size=3,
-            padding=1,
-            bias=True,
-        )
-        nn.init.constant_(self.offset_mask.weight, 0.0)
-        nn.init.constant_(self.offset_mask.bias, 0.0)
+        if self.use_deformable:
+            self.offset_mask = nn.Conv2d(
+                condition_channels,
+                3 * kernel_size * kernel_size,
+                kernel_size=3,
+                padding=1,
+                bias=True,
+            )
+            nn.init.constant_(self.offset_mask.weight, 0.0)
+            nn.init.constant_(self.offset_mask.bias, 0.0)
+        else:
+            self.offset_mask = None
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         if not self.use_deformable:
             return F.conv2d(x, self.weight, self.bias, padding=self.padding)
 
+        if self.offset_mask is None:
+            raise RuntimeError("offset_mask is required when deformable convolution is enabled.")
         offset_mask = self.offset_mask(cond)
         k2 = self.kernel_size * self.kernel_size
         offset = offset_mask[:, : 2 * k2]

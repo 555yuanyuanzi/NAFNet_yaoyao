@@ -147,7 +147,162 @@ class WaveletDualFrequencyProgressiveBlock(nn.Module):
         return self._last_aux
 
 
+class WaveletFreqGuidedSpatialAttention(nn.Module):
+    """
+    Tier-1 shallow wavelet cue.
+
+    It uses Haar high-frequency energy to predict a spatial attention map,
+    then applies a lightweight residual modulation to the normalized feature.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        spatial_hidden: int = 16,
+    ) -> None:
+        super().__init__()
+        self.norm = LayerNorm2d(channels)
+        self.frequency_extractor = HaarWaveletFrequencyExtractor()
+        self.spatial_attn = nn.Sequential(
+            nn.Conv2d(1, spatial_hidden, kernel_size=3, padding=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(spatial_hidden, 1, kernel_size=3, padding=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self._last_aux: dict[str, torch.Tensor] = {}
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        x_norm = self.norm(x)
+        _, x_high = self.frequency_extractor(x_norm)
+
+        energy = x_high.square().mean(dim=1, keepdim=True)
+        attn = self.spatial_attn(energy)
+        out = identity + self.gamma * (attn * x_norm)
+
+        self._last_aux = {
+            "high_energy": x_high.abs().mean().detach(),
+            "spatial_attn_mean": attn.mean().detach(),
+        }
+        return out
+
+    def get_last_aux(self) -> dict[str, torch.Tensor]:
+        return self._last_aux
+
+
+class WaveletSubbandRecalibration(nn.Module):
+    """
+    Tier-2 middle wavelet subband recalibration.
+
+    It decomposes features into Haar low/high bands, recalibrates each band
+    with separate channel gates, then recombines them with a residual 1x1
+    projection.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        reduction: int = 4,
+    ) -> None:
+        super().__init__()
+        self.norm = LayerNorm2d(channels)
+        self.frequency_extractor = HaarWaveletFrequencyExtractor()
+        mid_channels = max(channels // reduction, 8)
+        self.low_se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, mid_channels, kernel_size=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(mid_channels, channels, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.high_se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, mid_channels, kernel_size=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(mid_channels, channels, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self._last_aux: dict[str, torch.Tensor] = {}
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        x_norm = self.norm(x)
+        x_low, x_high = self.frequency_extractor(x_norm)
+
+        low_weight = self.low_se(x_low)
+        high_weight = self.high_se(x_high)
+        fused = self.proj(x_low * low_weight + x_high * high_weight)
+        out = identity + self.gamma * fused
+
+        self._last_aux = {
+            "low_energy": x_low.abs().mean().detach(),
+            "high_energy": x_high.abs().mean().detach(),
+            "low_weight_mean": low_weight.mean().detach(),
+            "high_weight_mean": high_weight.mean().detach(),
+        }
+        return out
+
+    def get_last_aux(self) -> dict[str, torch.Tensor]:
+        return self._last_aux
+
+
+class WaveletFrequencyAwareBlock(nn.Module):
+    """
+    Layer-wise wavelet frequency-aware block.
+
+    tier=1: Haar high-frequency guided spatial attention.
+    tier=2: Haar low/high subband channel recalibration.
+    tier=3: full WaveletDualFrequencyProgressiveBlock.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        tier: int,
+        spatial_hidden: int = 16,
+        reduction: int = 4,
+        low_blocks: int = 1,
+        branch_expand_ratio: int = 2,
+        use_deformable_fusion: bool = True,
+    ) -> None:
+        super().__init__()
+        self.tier = tier
+        if tier == 1:
+            self.block = WaveletFreqGuidedSpatialAttention(
+                channels=channels,
+                spatial_hidden=spatial_hidden,
+            )
+        elif tier == 2:
+            self.block = WaveletSubbandRecalibration(
+                channels=channels,
+                reduction=reduction,
+            )
+        elif tier == 3:
+            self.block = WaveletDualFrequencyProgressiveBlock(
+                channels=channels,
+                low_blocks=low_blocks,
+                branch_expand_ratio=branch_expand_ratio,
+                use_deformable_fusion=use_deformable_fusion,
+            )
+        else:
+            raise ValueError(f"Unknown wavelet frequency-aware tier: {tier}.")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+    def get_last_aux(self) -> dict[str, torch.Tensor]:
+        if hasattr(self.block, "get_last_aux"):
+            return self.block.get_last_aux()
+        return {}
+
+
 __all__ = [
     "HaarWaveletFrequencyExtractor",
     "WaveletDualFrequencyProgressiveBlock",
+    "WaveletFreqGuidedSpatialAttention",
+    "WaveletSubbandRecalibration",
+    "WaveletFrequencyAwareBlock",
 ]

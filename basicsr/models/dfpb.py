@@ -144,20 +144,25 @@ class ConditionedDeformableConv2d(nn.Module):
         self.bias = nn.Parameter(torch.zeros(channels))
         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
 
-        self.offset_mask = nn.Conv2d(
-            condition_channels,
-            3 * kernel_size * kernel_size,
-            kernel_size=3,
-            padding=1,
-            bias=True,
-        )
-        nn.init.constant_(self.offset_mask.weight, 0.0)
-        nn.init.constant_(self.offset_mask.bias, 0.0)
+        if self.use_deformable:
+            self.offset_mask = nn.Conv2d(
+                condition_channels,
+                3 * kernel_size * kernel_size,
+                kernel_size=3,
+                padding=1,
+                bias=True,
+            )
+            nn.init.constant_(self.offset_mask.weight, 0.0)
+            nn.init.constant_(self.offset_mask.bias, 0.0)
+        else:
+            self.offset_mask = None
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         if not self.use_deformable:
             return F.conv2d(x, self.weight, self.bias, padding=self.padding)
 
+        if self.offset_mask is None:
+            raise RuntimeError("offset_mask is required when deformable convolution is enabled.")
         offset_mask = self.offset_mask(cond)
         k2 = self.kernel_size * self.kernel_size
         offset = offset_mask[:, : 2 * k2]
@@ -313,10 +318,173 @@ class DualFrequencyProgressiveBlock(nn.Module):
         return self._last_aux
 
 
+class FreqGuidedSpatialAttention(nn.Module):
+    """
+    Tier-1 shallow frequency cue.
+
+    It uses high-frequency energy to predict a spatial attention map, then
+    applies a lightweight residual modulation to the normalized input feature.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        low_kernel_size: int = 5,
+        spatial_hidden: int = 16,
+    ) -> None:
+        super().__init__()
+        self.norm = LayerNorm2d(channels)
+        self.low_pass = AdaptiveLowPassExtractor(channels, kernel_size=low_kernel_size)
+        self.spatial_attn = nn.Sequential(
+            nn.Conv2d(1, spatial_hidden, kernel_size=3, padding=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(spatial_hidden, 1, kernel_size=3, padding=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self._last_aux: dict[str, torch.Tensor] = {}
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        x_norm = self.norm(x)
+        x_low = self.low_pass(x_norm)
+        x_high = x_norm - x_low
+
+        energy = x_high.square().mean(dim=1, keepdim=True)
+        attn = self.spatial_attn(energy)
+        out = identity + self.gamma * (attn * x_norm)
+
+        self._last_aux = {
+            "high_energy": x_high.abs().mean().detach(),
+            "spatial_attn_mean": attn.mean().detach(),
+        }
+        return out
+
+    def get_last_aux(self) -> dict[str, torch.Tensor]:
+        return self._last_aux
+
+
+class FreqSubbandRecalibration(nn.Module):
+    """
+    Tier-2 middle frequency-band recalibration.
+
+    The block decomposes features into low/high bands, recalibrates each band
+    with separate channel gates, then recombines them with a residual 1x1
+    projection.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        low_kernel_size: int = 5,
+        reduction: int = 4,
+    ) -> None:
+        super().__init__()
+        self.norm = LayerNorm2d(channels)
+        self.low_pass = AdaptiveLowPassExtractor(channels, kernel_size=low_kernel_size)
+        mid_channels = max(channels // reduction, 8)
+        self.low_se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, mid_channels, kernel_size=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(mid_channels, channels, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.high_se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, mid_channels, kernel_size=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(mid_channels, channels, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self._last_aux: dict[str, torch.Tensor] = {}
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        x_norm = self.norm(x)
+        x_low = self.low_pass(x_norm)
+        x_high = x_norm - x_low
+
+        low_weight = self.low_se(x_low)
+        high_weight = self.high_se(x_high)
+        fused = self.proj(x_low * low_weight + x_high * high_weight)
+        out = identity + self.gamma * fused
+
+        self._last_aux = {
+            "low_energy": x_low.abs().mean().detach(),
+            "high_energy": x_high.abs().mean().detach(),
+            "low_weight_mean": low_weight.mean().detach(),
+            "high_weight_mean": high_weight.mean().detach(),
+        }
+        return out
+
+    def get_last_aux(self) -> dict[str, torch.Tensor]:
+        return self._last_aux
+
+
+class FrequencyAwareBlock(nn.Module):
+    """
+    Layer-wise frequency-aware block.
+
+    tier=1: high-frequency guided spatial attention.
+    tier=2: low/high subband channel recalibration.
+    tier=3: full DualFrequencyProgressiveBlock.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        tier: int,
+        low_kernel_size: int = 5,
+        spatial_hidden: int = 16,
+        reduction: int = 4,
+        low_blocks: int = 1,
+        branch_expand_ratio: int = 2,
+        use_deformable_fusion: bool = True,
+    ) -> None:
+        super().__init__()
+        self.tier = tier
+        if tier == 1:
+            self.block = FreqGuidedSpatialAttention(
+                channels=channels,
+                low_kernel_size=low_kernel_size,
+                spatial_hidden=spatial_hidden,
+            )
+        elif tier == 2:
+            self.block = FreqSubbandRecalibration(
+                channels=channels,
+                low_kernel_size=low_kernel_size,
+                reduction=reduction,
+            )
+        elif tier == 3:
+            self.block = DualFrequencyProgressiveBlock(
+                channels=channels,
+                low_kernel_size=low_kernel_size,
+                low_blocks=low_blocks,
+                branch_expand_ratio=branch_expand_ratio,
+                use_deformable_fusion=use_deformable_fusion,
+            )
+        else:
+            raise ValueError(f"Unknown frequency-aware tier: {tier}.")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+    def get_last_aux(self) -> dict[str, torch.Tensor]:
+        if hasattr(self.block, "get_last_aux"):
+            return self.block.get_last_aux()
+        return {}
+
+
 __all__ = [
     "AdaptiveLowPassExtractor",
     "LowFrequencyRestorer",
     "HighFrequencyRectifier",
     "LowGuidedDeformableFusion",
     "DualFrequencyProgressiveBlock",
+    "FreqGuidedSpatialAttention",
+    "FreqSubbandRecalibration",
+    "FrequencyAwareBlock",
 ]
