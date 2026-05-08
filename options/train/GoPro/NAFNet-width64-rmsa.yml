@@ -52,7 +52,6 @@ network_g:
   rmsa_kwargs:
     hidden_ratio: 1.0
     pos_bands: 4
-    offset_limit: 2.0
     scale_limit: 0.5
 
 # path
