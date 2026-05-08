@@ -22,7 +22,7 @@ from basicsr.models.GDPM import GlobalDirectionalPriorModulation
 from basicsr.models.IPP import InterpolatedPatchPrior
 from basicsr.models.PA import PatchAveraging
 from basicsr.models.BASF import BlurAwareSkipFusion
-from basicsr.models.dfpb import DualFrequencyProgressiveBlock, FrequencyAwareBlock
+from basicsr.models.dfpb import AdaptiveLowPassExtractor, DualFrequencyProgressiveBlock, FrequencyAwareBlock
 from basicsr.models.fftdfpb import FFTDualFrequencyProgressiveBlock
 from basicsr.models.wavedfpb import WaveletDualFrequencyProgressiveBlock, WaveletFrequencyAwareBlock
 from basicsr.models.RMSA import RotaryMotionAwareSkipAlignment
@@ -58,6 +58,26 @@ class IPPGate(nn.Module):
         return x1 * x2
 
 
+class NAFBlockFrequencyGate(nn.Module):
+    def __init__(self, channels, low_kernel_size=5, hidden_channels=16):
+        super().__init__()
+        self.low_pass = AdaptiveLowPassExtractor(channels, kernel_size=low_kernel_size)
+        self.gate = nn.Sequential(
+            nn.Conv2d(1, hidden_channels, kernel_size=3, padding=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, 1, kernel_size=3, padding=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    def forward(self, x):
+        x_low = self.low_pass(x)
+        x_high = x - x_low
+        energy = x_high.square().mean(dim=1, keepdim=True)
+        gate = self.gate(energy)
+        return x + self.scale * gate * x
+
+
 class NAFBlock(nn.Module):
     def __init__(
         self,
@@ -70,6 +90,9 @@ class NAFBlock(nn.Module):
         use_ipp=False,
         ipp_patch_size=8,
         use_ipp_in_ffn=False,
+        use_freq_gate=False,
+        freq_gate_low_kernel_size=5,
+        freq_gate_hidden_channels=16,
     ):
         super().__init__()
 
@@ -96,6 +119,15 @@ class NAFBlock(nn.Module):
         ffn_channel = FFN_Expand * c
         self.sg = build_gate(dw_channel // 2, use_ipp)
         self.ffn_sg = build_gate(ffn_channel // 2, use_ipp and use_ipp_in_ffn)
+        self.freq_gate = (
+            NAFBlockFrequencyGate(
+                dw_channel // 2,
+                low_kernel_size=freq_gate_low_kernel_size,
+                hidden_channels=freq_gate_hidden_channels,
+            )
+            if use_freq_gate
+            else nn.Identity()
+        )
 
         self.conv4 = nn.Conv2d(in_channels=c, out_channels=ffn_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
         self.conv5 = nn.Conv2d(in_channels=ffn_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
@@ -117,6 +149,7 @@ class NAFBlock(nn.Module):
         x = self.conv1(x)
         x = self.conv2(x)
         x = self.sg(x)
+        x = self.freq_gate(x)
         x = x * self.sca(x)
         x = self.conv3(x)
 
@@ -147,6 +180,9 @@ class NAFNet(nn.Module):
         use_pa=False,
         pa_patch_size=8,
         pa_stages=None,
+        use_nafblock_freq_gate=False,
+        nafblock_freq_gate_stages=None,
+        nafblock_freq_gate_kwargs=None,
         use_ipp=False,
         ipp_patch_size=8,
         ipp_stages=None,
@@ -196,6 +232,7 @@ class NAFNet(nn.Module):
         self.ups = nn.ModuleList()
         self.downs = nn.ModuleList()
         pa_stages = set(pa_stages or [])
+        nafblock_freq_gate_stages = set(nafblock_freq_gate_stages or [])
         ipp_stages = set(ipp_stages or [])
         dfpb_stages = set(dfpb_stages or [])
         fftdfpb_stages = set(fftdfpb_stages or [])
@@ -216,6 +253,8 @@ class NAFNet(nn.Module):
         layerwise_wavedfpb_stage_kwargs = layerwise_wavedfpb_kwargs.pop('stage_kwargs', {})
         layerwise_dfpb_tier_map = layerwise_dfpb_kwargs.pop('tier_map', {})
         layerwise_wavedfpb_tier_map = layerwise_wavedfpb_kwargs.pop('tier_map', {})
+        nafblock_freq_gate_kwargs = {} if nafblock_freq_gate_kwargs is None else dict(nafblock_freq_gate_kwargs)
+        nafblock_freq_gate_stage_kwargs = nafblock_freq_gate_kwargs.pop('stage_kwargs', {})
         basf_kwargs = {} if basf_kwargs is None else dict(basf_kwargs)
         rmsa_kwargs = {} if rmsa_kwargs is None else dict(rmsa_kwargs)
         if use_dfpb and use_fftdfpb and (dfpb_stages & fftdfpb_stages):
@@ -316,6 +355,9 @@ class NAFNet(nn.Module):
         def build_block(channels, stage_name):
             pa_active = use_pa and stage_name in pa_stages
             ipp_active = use_ipp and stage_name in ipp_stages
+            freq_gate_active = use_nafblock_freq_gate and stage_name in nafblock_freq_gate_stages
+            freq_gate_kwargs = dict(nafblock_freq_gate_kwargs)
+            freq_gate_kwargs.update(nafblock_freq_gate_stage_kwargs.get(stage_name, {}))
             return NAFBlock(
                 channels,
                 use_pa=pa_active,
@@ -323,6 +365,8 @@ class NAFNet(nn.Module):
                 use_ipp=ipp_active,
                 ipp_patch_size=ipp_patch_size,
                 use_ipp_in_ffn=ipp_in_ffn and ipp_active,
+                use_freq_gate=freq_gate_active,
+                **freq_gate_kwargs,
             )
 
         chan = width
