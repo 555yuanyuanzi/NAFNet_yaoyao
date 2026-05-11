@@ -68,9 +68,9 @@ network_g:
       enc4: 3
     stage_kwargs:
       enc1:
-        low_kernel_size: 9
+        low_kernel_size: 5
       enc2:
-        low_kernel_size: 7
+        low_kernel_size: 5
       enc3:
         low_kernel_size: 5
       enc4:
@@ -107,7 +107,7 @@ train:
 
 # validation settings
 val:
-  val_freq: !!float 1e4
+  val_freq: !!float 2e4
   save_img: false
 
 
@@ -124,7 +124,7 @@ val:
 # logging settings
 logger:
   print_freq: 200
-  save_checkpoint_freq: !!float 5e3
+  save_checkpoint_freq: !!float 1e4
   use_tb_logger: true
   wandb:
     project: ~

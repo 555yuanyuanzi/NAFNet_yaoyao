@@ -23,7 +23,6 @@
 | `NAFNet-width64-wavedfpb.yml` | `NAFNet-GoPro-width64-WaveDFPB` | 在所有 encoder 阶段后加入小波双频模块。 | WaveDFPB |
 | `NAFNet-width64-layerwise-dfpb.yml` | `NAFNet-GoPro-width64-LayerwiseDFPB` | 按 encoder 深度使用不同复杂度的频率模块。 | Layerwise DFPB |
 | `NAFNet-width64-layerwise-wavedfpb.yml` | `NAFNet-GoPro-width64-LayerwiseWaveDFPB` | 按 encoder 深度使用不同复杂度的小波频率模块。 | Layerwise WaveDFPB |
-| `NAFNet-width64-basf.yml` | `NAFNet-GoPro-width64-BASF` | 用 blur-aware skip fusion 替换 decoder skip 直接相加。 | BASF |
 | `NAFNet-width64-rmsa.yml` | `NAFNet-GoPro-width64-RMSA` | 在部分 decoder skip 处做旋转运动感知对齐。 | RMSA |
 | `NAFNet-width64-nafgate-dfpb.yml` | `NAFNet-GoPro-width64-NAFGate-DFPB` | 浅层 NAFBlock 频率 gate + 深层 DFPB 的组合实验。 | NAFBlockFrequencyGate + DFPB |
 
@@ -318,34 +317,6 @@
 
 ## Skip Fusion 实验
 
-### `NAFNet-width64-basf.yml`
-
-作用：用 Blur-Aware Skip Fusion 替换 decoder skip 直接相加。
-
-新增模块：`BlurAwareSkipFusion`。
-
-模块位置：
-
-- `use_basf: true`。
-- 启用阶段：`dec1`、`dec2`、`dec3`、`dec4`。
-- 替换这些 decoder stage 的普通 skip add。
-- `use_dfpb: false`，`use_gdpm: false`，`use_pa: false`。
-
-关键 BASF 设置：
-
-- `hidden_ratio: 1.0`
-- `scale_limit: 0.5`
-
-设计意图：
-
-- 让 decoder feature 和 encoder skip feature 根据模糊感知 gate 自适应融合。
-- 避免所有 skip 信息都被无条件直接相加。
-
-关键训练设置：
-
-- 使用 `/home/young/yaoyao-workdir/polar/data`。
-- `lr: 7e-4`，`val_freq: 1e4`。
-
 ### `NAFNet-width64-rmsa.yml`
 
 作用：在部分 decoder skip 处进行 Rotary Motion-Aware Skip Alignment。
@@ -356,7 +327,7 @@
 
 - `use_rmsa: true`。
 - 启用阶段：`dec1`、`dec2`。
-- `use_basf: false`，`use_dfpb: false`，`use_gdpm: false`，`use_pa: false`。
+- `use_dfpb: false`，`use_gdpm: false`，`use_pa: false`。
 
 关键 RMSA 设置：
 
@@ -426,6 +397,6 @@ DFPB 设置：
 | --- | --- | --- | --- | --- |
 | `NAFNet-width32.yml` | 官方 GoPro LMDB | `1e-3` | `2e4` | 小模型 baseline |
 | `NAFNet-width64.yml`、`gdpm`、`pa`、`ipp`、`dfpb`、`fftdfpb`、`wavedfpb` | `/home/young/.../polar/data` disk | `1e-3` | `2e4` | baseline 和早期模块消融 |
-| `basf`、`rmsa` | `/home/young/.../polar/data` disk | `7e-4` | `1e4` | skip fusion 消融 |
+| `rmsa` | `/home/young/.../polar/data` disk | `7e-4` | `1e4` | skip fusion 消融 |
 | `layerwise-dfpb`、`layerwise-wavedfpb`、`nafgate-dfpb` | `/workspace/polarv1/...` LMDB train + disk val | `7e-4` | `1e4` | 较新的频率/组合模块实验 |
 

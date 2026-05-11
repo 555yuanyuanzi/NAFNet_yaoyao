@@ -10,12 +10,12 @@ datasets:
   train:
     name: gopro-train
     type: PairedImageDataset
-    dataroot_gt: /home/young/yaoyao-workdir/polar/data/train/sharp
-    dataroot_lq: /home/young/yaoyao-workdir/polar/data/train/blur
+    dataroot_gt: /workspace/polarv1/data/gopro_v1/flat/train/sharp_crops.lmdb
+    dataroot_lq: /workspace/polarv1/data/gopro_v1/flat/train/blur_crops.lmdb
 
     filename_tmpl: '{}'
     io_backend:
-      type: disk
+      type: lmdb
 
     gt_size: 256
     use_flip: true
@@ -24,15 +24,15 @@ datasets:
     # data loader
     use_shuffle: true
     num_worker_per_gpu: 4
-    batch_size_per_gpu: 4
+    batch_size_per_gpu: 8
     dataset_enlarge_ratio: 1
     prefetch_mode: ~
 
   val:
     name: gopro-test
     type: PairedImageDataset
-    dataroot_gt: /home/young/yaoyao-workdir/polar/data/test/sharp
-    dataroot_lq: /home/young/yaoyao-workdir/polar/data/test/blur
+    dataroot_gt: /workspace/polarv1/data/gopro_v1/flat/test/sharp
+    dataroot_lq: /workspace/polarv1/data/gopro_v1/flat/test/blur
     io_backend:
       type: disk
 
@@ -61,7 +61,7 @@ path:
 train:
   optim_g:
     type: AdamW
-    lr: !!float 1e-3
+    lr: !!float 7e-4
     weight_decay: !!float 1e-3
     betas: [0.9, 0.9]
 
@@ -98,7 +98,7 @@ val:
 # logging settings
 logger:
   print_freq: 200
-  save_checkpoint_freq: !!float 5e3
+  save_checkpoint_freq: !!float 1e4
   use_tb_logger: true
   wandb:
     project: ~

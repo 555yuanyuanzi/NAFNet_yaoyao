@@ -21,7 +21,6 @@ from basicsr.models.archs.local_arch import Local_Base
 from basicsr.models.GDPM import GlobalDirectionalPriorModulation
 from basicsr.models.IPP import InterpolatedPatchPrior
 from basicsr.models.PA import PatchAveraging
-from basicsr.models.BASF import BlurAwareSkipFusion
 from basicsr.models.dfpb import AdaptiveLowPassExtractor, DualFrequencyProgressiveBlock, FrequencyAwareBlock
 from basicsr.models.fftdfpb import FFTDualFrequencyProgressiveBlock
 from basicsr.models.wavedfpb import WaveletDualFrequencyProgressiveBlock, WaveletFrequencyAwareBlock
@@ -202,9 +201,6 @@ class NAFNet(nn.Module):
         use_layerwise_wavedfpb=False,
         layerwise_wavedfpb_kwargs=None,
         layerwise_wavedfpb_stages=None,
-        use_basf=False,
-        basf_kwargs=None,
-        basf_stages=None,
         use_rmsa=False,
         rmsa_kwargs=None,
         rmsa_stages=None,
@@ -239,7 +235,6 @@ class NAFNet(nn.Module):
         wavedfpb_stages = set(wavedfpb_stages or [])
         layerwise_dfpb_stages = set(layerwise_dfpb_stages or [])
         layerwise_wavedfpb_stages = set(layerwise_wavedfpb_stages or [])
-        basf_stages = set(basf_stages or [])
         rmsa_stages = set(rmsa_stages or [])
         dfpb_kwargs = {} if dfpb_kwargs is None else dict(dfpb_kwargs)
         fftdfpb_kwargs = {} if fftdfpb_kwargs is None else dict(fftdfpb_kwargs)
@@ -255,7 +250,6 @@ class NAFNet(nn.Module):
         layerwise_wavedfpb_tier_map = layerwise_wavedfpb_kwargs.pop('tier_map', {})
         nafblock_freq_gate_kwargs = {} if nafblock_freq_gate_kwargs is None else dict(nafblock_freq_gate_kwargs)
         nafblock_freq_gate_stage_kwargs = nafblock_freq_gate_kwargs.pop('stage_kwargs', {})
-        basf_kwargs = {} if basf_kwargs is None else dict(basf_kwargs)
         rmsa_kwargs = {} if rmsa_kwargs is None else dict(rmsa_kwargs)
         if use_dfpb and use_fftdfpb and (dfpb_stages & fftdfpb_stages):
             raise ValueError('dfpb_stages and fftdfpb_stages cannot overlap when both blocks are enabled.')
@@ -282,7 +276,6 @@ class NAFNet(nn.Module):
         self.wavedfpb_modules = nn.ModuleDict()
         self.layerwise_dfpb_modules = nn.ModuleDict()
         self.layerwise_wavedfpb_modules = nn.ModuleDict()
-        self.basf_modules = nn.ModuleDict()
         self.rmsa_modules = nn.ModuleDict()
 
         def register_dfpb(channels, stage_name):
@@ -336,13 +329,6 @@ class NAFNet(nn.Module):
                     channels=channels,
                     tier=int(tier),
                     **kwargs,
-                )
-
-        def register_basf(channels, stage_name):
-            if use_basf and stage_name in basf_stages:
-                self.basf_modules[stage_name] = BlurAwareSkipFusion(
-                    channels=channels,
-                    **basf_kwargs,
                 )
 
         def register_rmsa(channels, stage_name):
@@ -412,7 +398,6 @@ class NAFNet(nn.Module):
                 )
             )
             register_rmsa(chan, stage_name)
-            register_basf(chan, stage_name)
             register_dfpb(chan, stage_name)
             register_fftdfpb(chan, stage_name)
             register_wavedfpb(chan, stage_name)
@@ -449,9 +434,7 @@ class NAFNet(nn.Module):
     def _fuse_skip(self, stage_name, x_dec, x_skip):
         if stage_name in self.rmsa_modules:
             return self.rmsa_modules[stage_name](x_dec, x_skip)
-        if stage_name not in self.basf_modules:
-            return x_dec + x_skip
-        return self.basf_modules[stage_name](x_dec, x_skip)
+        return x_dec + x_skip
 
     def forward(self, inp):
         B, C, H, W = inp.shape
