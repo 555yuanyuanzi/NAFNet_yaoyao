@@ -176,6 +176,86 @@ class RoPESpatialGate(nn.Module):
         return self._last_aux
 
 
+class ManifoldCurvatureEnhance(nn.Module):
+    """
+    Curvature-guided decoder enhancement.
+
+    The module estimates local curvature responses with finite differences and
+    uses them to mix a smooth branch and a detail branch. A zero-initialized
+    residual scale keeps the decoder unchanged at initialization.
+    """
+
+    def __init__(
+        self,
+        channels,
+        kernel_size=5,
+        scale_limit=0.5,
+    ):
+        super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError('kernel_size must be odd.')
+        if scale_limit <= 0:
+            raise ValueError('scale_limit must be positive.')
+
+        self.scale_limit = scale_limit
+        self.smooth_branch = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=channels,
+            bias=True,
+        )
+        self.enhance_branch = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=True),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=True),
+        )
+        self.curvature_map = nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=True)
+        self.scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self._last_aux = {}
+
+    def _calc_curvature_weight(self, x):
+        grad_x = x[:, :, :, 1:] - x[:, :, :, :-1]
+        grad_y = x[:, :, 1:, :] - x[:, :, :-1, :]
+        grad_x = F.pad(grad_x, (0, 1, 0, 0), mode='replicate')
+        grad_y = F.pad(grad_y, (0, 0, 0, 1), mode='replicate')
+
+        grad_xx = grad_x[:, :, :, 1:] - grad_x[:, :, :, :-1]
+        grad_yy = grad_y[:, :, 1:, :] - grad_y[:, :, :-1, :]
+        grad_xx = F.pad(grad_xx, (0, 1, 0, 0), mode='replicate')
+        grad_yy = F.pad(grad_yy, (0, 0, 0, 1), mode='replicate')
+
+        curvature_feat = torch.cat(
+            [
+                grad_xx.abs().mean(dim=1, keepdim=True),
+                grad_yy.abs().mean(dim=1, keepdim=True),
+            ],
+            dim=1,
+        )
+        return torch.sigmoid(self.curvature_map(curvature_feat))
+
+    def forward(self, x, return_aux=False):
+        weight = self._calc_curvature_weight(x)
+        smooth = self.smooth_branch(x)
+        enhance = self.enhance_branch(x)
+        residual = weight * enhance + (1.0 - weight) * smooth
+        alpha = self.scale_limit * torch.tanh(self.scale)
+        out = x + alpha * residual
+
+        self._last_aux = {
+            'weight_mean': weight.mean().detach(),
+            'weight_std': weight.std().detach(),
+            'alpha_abs_mean': alpha.abs().mean().detach(),
+        }
+        if return_aux:
+            return out, {'weight': weight, 'stats': self._last_aux}
+        return out
+
+    def get_last_aux(self):
+        return self._last_aux
+
+
 class NAFBlock(nn.Module):
     def __init__(
         self,
@@ -308,6 +388,8 @@ class NAFNet(nn.Module):
         use_layerwise_wavedfpb=False,
         layerwise_wavedfpb_kwargs=None,
         layerwise_wavedfpb_stages=None,
+        use_decoder_mce=False,
+        decoder_mce_kwargs=None,
         use_rmsa=False,
         rmsa_kwargs=None,
         rmsa_stages=None,
@@ -335,6 +417,7 @@ class NAFNet(nn.Module):
         self.middle_blks = nn.ModuleList()
         self.ups = nn.ModuleList()
         self.downs = nn.ModuleList()
+        self.decoder_mces = nn.ModuleList()
         pa_stages = set(pa_stages or [])
         nafblock_freq_gate_stages = set(nafblock_freq_gate_stages or [])
         ipp_stages = set(ipp_stages or [])
@@ -349,6 +432,7 @@ class NAFNet(nn.Module):
         wavedfpb_kwargs = {} if wavedfpb_kwargs is None else dict(wavedfpb_kwargs)
         layerwise_dfpb_kwargs = {} if layerwise_dfpb_kwargs is None else dict(layerwise_dfpb_kwargs)
         layerwise_wavedfpb_kwargs = {} if layerwise_wavedfpb_kwargs is None else dict(layerwise_wavedfpb_kwargs)
+        decoder_mce_kwargs = {} if decoder_mce_kwargs is None else dict(decoder_mce_kwargs)
         dfpb_stage_kwargs = dfpb_kwargs.pop('stage_kwargs', {})
         fftdfpb_stage_kwargs = fftdfpb_kwargs.pop('stage_kwargs', {})
         wavedfpb_stage_kwargs = wavedfpb_kwargs.pop('stage_kwargs', {})
@@ -509,6 +593,11 @@ class NAFNet(nn.Module):
                     *[build_block(chan, stage_name) for _ in range(num)]
                 )
             )
+            self.decoder_mces.append(
+                ManifoldCurvatureEnhance(chan, **decoder_mce_kwargs)
+                if use_decoder_mce
+                else nn.Identity()
+            )
             register_rmsa(chan, stage_name)
             register_dfpb(chan, stage_name)
             register_fftdfpb(chan, stage_name)
@@ -579,7 +668,10 @@ class NAFNet(nn.Module):
         x = self._apply_layerwise_dfpb('middle', x)
         x = self._apply_layerwise_wavedfpb('middle', x)
 
-        for stage_idx, (decoder, up, enc_skip) in enumerate(zip(self.decoders, self.ups, encs[::-1]), start=1):
+        for stage_idx, (decoder, up, enc_skip, decoder_mce) in enumerate(
+            zip(self.decoders, self.ups, encs[::-1], self.decoder_mces),
+            start=1,
+        ):
             stage_name = f'dec{stage_idx}'
             x = up(x)
             if isinstance(enc_skip, tuple):
@@ -588,6 +680,7 @@ class NAFNet(nn.Module):
                 enc_skip_ref = None
             x = self._fuse_skip(stage_name, x, enc_skip, x_skip_ref=enc_skip_ref)
             x = decoder(x)
+            x = decoder_mce(x)
             x = self._apply_dfpb(stage_name, x)
             x = self._apply_fftdfpb(stage_name, x)
             x = self._apply_wavedfpb(stage_name, x)
