@@ -1,6 +1,6 @@
-# CUDA_VISIBLE_DEVICES=1 python -m basicsr.train -opt options/train/GoPro/dfpb-rmsa.yml --launcher none > layerwise-dfpb_rmsa_train.log 2>&1 &
-
-name: NAFNet-GoPro-width64-DFPB-rmsa
+# python -m basicsr.train -opt options/train/GoPro/NAFNet-width64-rope-sca-hr0125.yml --launcher none
+# general settings
+name: NAFNet-GoPro-width64-RoPE-SCA-hr0125
 model_type: ImageRestorationModel
 scale: 1
 num_gpu: 1
@@ -13,7 +13,6 @@ datasets:
     dataroot_gt: /workspace/polarv1/data/gopro_v1/flat/train/sharp_crops.lmdb
     dataroot_lq: /workspace/polarv1/data/gopro_v1/flat/train/blur_crops.lmdb
 
-
     filename_tmpl: '{}'
     io_backend:
       type: lmdb
@@ -22,7 +21,6 @@ datasets:
     use_flip: true
     use_rot: true
 
-    # data loader
     use_shuffle: true
     num_worker_per_gpu: 4
     batch_size_per_gpu: 8
@@ -37,8 +35,6 @@ datasets:
     io_backend:
       type: disk
 
-
-
 network_g:
   type: NAFNetLocal
   width: 64
@@ -48,52 +44,17 @@ network_g:
   use_gdpm: false
   use_pa: false
   use_dfpb: false
-  use_fftdfpb: false
-  use_wavedfpb: false
-  use_layerwise_dfpb: true
-
-  use_rmsa: true
-  rmsa_stages: [dec1, dec2]
-  rmsa_use_raw_skip_ref: true
-  rmsa_kwargs:
-    hidden_ratio: 1.0
+  use_rope_sca: true
+  rope_sca_kwargs:
+    hidden_ratio: 0.125
     pos_bands: 4
     scale_limit: 0.5
-  # Ablation tips:
-  #   enc4 only: set layerwise_dfpb_stages to [enc4] and keep tier_map.enc4 = 3.
-  #   enc3+enc4: set layerwise_dfpb_stages to [enc3, enc4].
-  #   full layer-wise: keep [enc1, enc2, enc3, enc4].
-  layerwise_dfpb_stages: [enc1, enc2, enc3, enc4]
-  layerwise_dfpb_kwargs:
-    low_kernel_size: 5
-    spatial_hidden: 16
-    reduction: 4
-    low_blocks: 1
-    branch_expand_ratio: 2
-    use_deformable_fusion: true
-    tier_map:
-      enc1: 1
-      enc2: 1
-      enc3: 2
-      enc4: 3
-    stage_kwargs:
-      enc1:
-        low_kernel_size: 5
-      enc2:
-        low_kernel_size: 5
-      enc3:
-        low_kernel_size: 5
-      enc4:
-        low_kernel_size: 5
-        use_deformable_fusion: true
 
-# path
 path:
   pretrain_network_g: ~
   strict_load_g: true
-  resume_state: /home/ls/disk/user/qy/NAFNet_yaoyao/experiments/NAFNet-GoPro-width64-LayerwiseDFPB/models/net_g_10000.pth
+  resume_state: ~
 
-# training settings
 train:
   optim_g:
     type: AdamW
@@ -107,22 +68,19 @@ train:
     eta_min: !!float 1e-7
 
   total_iter: 400000
-  warmup_iter: -1 # no warm up
+  warmup_iter: -1
 
-  # losses
   pixel_opt:
     type: PSNRLoss
     loss_weight: 1
     reduction: mean
 
-# validation settings
 val:
   val_freq: !!float 2e4
   save_img: false
 
-
   metrics:
-    psnr: # metric name, can be arbitrary
+    psnr:
       type: calculate_psnr
       crop_border: 0
       test_y_channel: false
@@ -131,7 +89,6 @@ val:
       crop_border: 0
       test_y_channel: false
 
-# logging settings
 logger:
   print_freq: 200
   save_checkpoint_freq: !!float 1e4
@@ -140,7 +97,6 @@ logger:
     project: ~
     resume_id: ~
 
-# dist training settings
 dist_params:
   backend: nccl
   port: 29500

@@ -99,10 +99,12 @@ class RotaryMotionAwareSkipAlignment(nn.Module):
         self,
         x_dec: torch.Tensor,
         x_skip: torch.Tensor,
+        x_skip_ref: torch.Tensor | None = None,
         return_aux: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        skip_ref = x_skip if x_skip_ref is None else x_skip_ref
         dec_phase = self._apply_2d_rope(self.dec_proj(self.norm_dec(x_dec)))
-        skip_phase = self._apply_2d_rope(self.skip_proj(self.norm_skip(x_skip)))
+        skip_phase = self._apply_2d_rope(self.skip_proj(self.norm_skip(skip_ref)))
         phase_delta = dec_phase - skip_phase
         phase_product = dec_phase * skip_phase
         context = self.context(torch.cat([dec_phase, skip_phase, phase_delta, phase_product], dim=1))
