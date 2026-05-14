@@ -13,8 +13,6 @@ Simple Baselines for Image Restoration
 }
 '''
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,6 +24,7 @@ from basicsr.models.PA import PatchAveraging
 from basicsr.models.dfpb import AdaptiveLowPassExtractor, DualFrequencyProgressiveBlock, FrequencyAwareBlock
 from basicsr.models.fftdfpb import FFTDualFrequencyProgressiveBlock
 from basicsr.models.wavedfpb import WaveletDualFrequencyProgressiveBlock, WaveletFrequencyAwareBlock
+from basicsr.models.polar_moe import PolarMoEDecoderBlock
 from basicsr.models.RMSA import RotaryMotionAwareSkipAlignment
 
 class SimpleGate(nn.Module):
@@ -77,103 +76,6 @@ class NAFBlockFrequencyGate(nn.Module):
         energy = x_high.square().mean(dim=1, keepdim=True)
         gate = self.gate(energy)
         return x + self.scale * gate * x
-
-
-class RoPESpatialGate(nn.Module):
-    """
-    Lightweight RoPE spatial gate for NAFBlock.
-
-    The branch injects 2D rotary phase into a reduced feature space and predicts
-    a spatial-channel gate. It avoids quadratic token attention so it can be
-    used inside restoration blocks.
-    """
-
-    def __init__(
-        self,
-        channels,
-        hidden_ratio=0.25,
-        pos_bands=4,
-        scale_limit=0.5,
-    ):
-        super().__init__()
-        if hidden_ratio <= 0:
-            raise ValueError('hidden_ratio must be positive.')
-        if pos_bands < 1:
-            raise ValueError('pos_bands must be at least 1.')
-        if scale_limit <= 0:
-            raise ValueError('scale_limit must be positive.')
-
-        hidden_channels = max(4, int(channels * hidden_ratio))
-        hidden_channels = ((hidden_channels + 3) // 4) * 4
-        self.pos_bands = pos_bands
-        self.scale_limit = scale_limit
-
-        self.in_proj = nn.Conv2d(channels, hidden_channels, kernel_size=1, bias=True)
-        self.context = nn.Sequential(
-            nn.Conv2d(hidden_channels * 4, hidden_channels, kernel_size=1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1, groups=hidden_channels, bias=True),
-            nn.GELU(),
-        )
-        self.gate_head = nn.Sequential(
-            nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=True),
-            nn.Sigmoid(),
-        )
-        self.scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
-        self._last_aux = {}
-
-    def _build_rotary_phase(self, height, width, pair_count, device, dtype):
-        y = torch.linspace(-1.0, 1.0, steps=height, device=device, dtype=dtype)
-        x = torch.linspace(-1.0, 1.0, steps=width, device=device, dtype=dtype)
-        band_ids = torch.arange(pair_count, device=device, dtype=dtype)
-        freqs = math.pi * torch.pow(2.0, torch.remainder(band_ids, self.pos_bands))
-
-        phase_x = freqs.view(1, pair_count, 1, 1) * x.view(1, 1, 1, width)
-        phase_y = freqs.view(1, pair_count, 1, 1) * y.view(1, 1, height, 1)
-        return torch.sin(phase_x), torch.cos(phase_x), torch.sin(phase_y), torch.cos(phase_y)
-
-    @staticmethod
-    def _rotate_pairs(x, sin, cos):
-        even = x[:, 0::2]
-        odd = x[:, 1::2]
-        rot_even = even * cos - odd * sin
-        rot_odd = even * sin + odd * cos
-        return torch.stack([rot_even, rot_odd], dim=2).flatten(1, 2)
-
-    def _apply_2d_rope(self, x):
-        _, _, h, w = x.shape
-        x_part, y_part = x.chunk(2, dim=1)
-        pair_count = x_part.shape[1] // 2
-        sin_x, cos_x, sin_y, cos_y = self._build_rotary_phase(
-            h,
-            w,
-            pair_count,
-            x.device,
-            x.dtype,
-        )
-        x_rot = self._rotate_pairs(x_part, sin_x, cos_x)
-        y_rot = self._rotate_pairs(y_part, sin_y, cos_y)
-        return torch.cat([x_rot, y_rot], dim=1)
-
-    def forward(self, x, return_aux=False):
-        feat = self.in_proj(x)
-        rope_feat = self._apply_2d_rope(feat)
-        context = self.context(torch.cat([feat, rope_feat, rope_feat - feat, rope_feat * feat], dim=1))
-        gate = self.gate_head(context)
-        alpha = self.scale_limit * torch.tanh(self.scale)
-        out = alpha * gate * x
-
-        self._last_aux = {
-            'gate_mean': gate.mean().detach(),
-            'gate_std': gate.std().detach(),
-            'alpha_abs_mean': alpha.abs().mean().detach(),
-        }
-        if return_aux:
-            return out, {'gate': gate, 'stats': self._last_aux}
-        return out
-
-    def get_last_aux(self):
-        return self._last_aux
 
 
 class ManifoldCurvatureEnhance(nn.Module):
@@ -271,8 +173,6 @@ class NAFBlock(nn.Module):
         use_freq_gate=False,
         freq_gate_low_kernel_size=5,
         freq_gate_hidden_channels=16,
-        use_rope_sca=False,
-        rope_sca_kwargs=None,
     ):
         super().__init__()
 
@@ -308,9 +208,6 @@ class NAFBlock(nn.Module):
             if use_freq_gate
             else nn.Identity()
         )
-        rope_sca_kwargs = {} if rope_sca_kwargs is None else dict(rope_sca_kwargs)
-        self.rope_sca = RoPESpatialGate(dw_channel // 2, **rope_sca_kwargs) if use_rope_sca else None
-
         self.conv4 = nn.Conv2d(in_channels=c, out_channels=ffn_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
         self.conv5 = nn.Conv2d(in_channels=ffn_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
 
@@ -333,8 +230,6 @@ class NAFBlock(nn.Module):
         x = self.sg(x)
         x = self.freq_gate(x)
         x = x * self.sca(x)
-        if self.rope_sca is not None:
-            x = x + self.rope_sca(x)
         x = self.conv3(x)
 
         x = self.dropout1(x)
@@ -367,8 +262,6 @@ class NAFNet(nn.Module):
         use_nafblock_freq_gate=False,
         nafblock_freq_gate_stages=None,
         nafblock_freq_gate_kwargs=None,
-        use_rope_sca=False,
-        rope_sca_kwargs=None,
         use_ipp=False,
         ipp_patch_size=8,
         ipp_stages=None,
@@ -388,6 +281,9 @@ class NAFNet(nn.Module):
         use_layerwise_wavedfpb=False,
         layerwise_wavedfpb_kwargs=None,
         layerwise_wavedfpb_stages=None,
+        use_polar_moe=False,
+        polar_moe_kwargs=None,
+        polar_moe_stages=None,
         use_decoder_mce=False,
         decoder_mce_kwargs=None,
         use_rmsa=False,
@@ -426,23 +322,25 @@ class NAFNet(nn.Module):
         wavedfpb_stages = set(wavedfpb_stages or [])
         layerwise_dfpb_stages = set(layerwise_dfpb_stages or [])
         layerwise_wavedfpb_stages = set(layerwise_wavedfpb_stages or [])
+        polar_moe_stages = set(polar_moe_stages or [])
         rmsa_stages = set(rmsa_stages or [])
         dfpb_kwargs = {} if dfpb_kwargs is None else dict(dfpb_kwargs)
         fftdfpb_kwargs = {} if fftdfpb_kwargs is None else dict(fftdfpb_kwargs)
         wavedfpb_kwargs = {} if wavedfpb_kwargs is None else dict(wavedfpb_kwargs)
         layerwise_dfpb_kwargs = {} if layerwise_dfpb_kwargs is None else dict(layerwise_dfpb_kwargs)
         layerwise_wavedfpb_kwargs = {} if layerwise_wavedfpb_kwargs is None else dict(layerwise_wavedfpb_kwargs)
+        polar_moe_kwargs = {} if polar_moe_kwargs is None else dict(polar_moe_kwargs)
         decoder_mce_kwargs = {} if decoder_mce_kwargs is None else dict(decoder_mce_kwargs)
         dfpb_stage_kwargs = dfpb_kwargs.pop('stage_kwargs', {})
         fftdfpb_stage_kwargs = fftdfpb_kwargs.pop('stage_kwargs', {})
         wavedfpb_stage_kwargs = wavedfpb_kwargs.pop('stage_kwargs', {})
         layerwise_dfpb_stage_kwargs = layerwise_dfpb_kwargs.pop('stage_kwargs', {})
         layerwise_wavedfpb_stage_kwargs = layerwise_wavedfpb_kwargs.pop('stage_kwargs', {})
+        polar_moe_stage_kwargs = polar_moe_kwargs.pop('stage_kwargs', {})
         layerwise_dfpb_tier_map = layerwise_dfpb_kwargs.pop('tier_map', {})
         layerwise_wavedfpb_tier_map = layerwise_wavedfpb_kwargs.pop('tier_map', {})
         nafblock_freq_gate_kwargs = {} if nafblock_freq_gate_kwargs is None else dict(nafblock_freq_gate_kwargs)
         nafblock_freq_gate_stage_kwargs = nafblock_freq_gate_kwargs.pop('stage_kwargs', {})
-        rope_sca_kwargs = {} if rope_sca_kwargs is None else dict(rope_sca_kwargs)
         rmsa_kwargs = {} if rmsa_kwargs is None else dict(rmsa_kwargs)
         if use_dfpb and use_fftdfpb and (dfpb_stages & fftdfpb_stages):
             raise ValueError('dfpb_stages and fftdfpb_stages cannot overlap when both blocks are enabled.')
@@ -469,6 +367,7 @@ class NAFNet(nn.Module):
         self.wavedfpb_modules = nn.ModuleDict()
         self.layerwise_dfpb_modules = nn.ModuleDict()
         self.layerwise_wavedfpb_modules = nn.ModuleDict()
+        self.polar_moe_modules = nn.ModuleDict()
         self.rmsa_modules = nn.ModuleDict()
         self.rmsa_use_raw_skip_ref = rmsa_use_raw_skip_ref
 
@@ -525,6 +424,15 @@ class NAFNet(nn.Module):
                     **kwargs,
                 )
 
+        def register_polar_moe(channels, stage_name):
+            if use_polar_moe and stage_name in polar_moe_stages:
+                kwargs = dict(polar_moe_kwargs)
+                kwargs.update(polar_moe_stage_kwargs.get(stage_name, {}))
+                self.polar_moe_modules[stage_name] = PolarMoEDecoderBlock(
+                    channels=channels,
+                    **kwargs,
+                )
+
         def register_rmsa(channels, stage_name):
             if use_rmsa and stage_name in rmsa_stages:
                 self.rmsa_modules[stage_name] = RotaryMotionAwareSkipAlignment(
@@ -546,8 +454,6 @@ class NAFNet(nn.Module):
                 ipp_patch_size=ipp_patch_size,
                 use_ipp_in_ffn=ipp_in_ffn and ipp_active,
                 use_freq_gate=freq_gate_active,
-                use_rope_sca=use_rope_sca,
-                rope_sca_kwargs=rope_sca_kwargs,
                 **freq_gate_kwargs,
             )
 
@@ -604,6 +510,7 @@ class NAFNet(nn.Module):
             register_wavedfpb(chan, stage_name)
             register_layerwise_dfpb(chan, stage_name)
             register_layerwise_wavedfpb(chan, stage_name)
+            register_polar_moe(chan, stage_name)
 
         self.padder_size = 2 ** len(self.encoders)
 
@@ -631,6 +538,11 @@ class NAFNet(nn.Module):
         if stage_name not in self.layerwise_wavedfpb_modules:
             return x
         return self.layerwise_wavedfpb_modules[stage_name](x)
+
+    def _apply_polar_moe(self, stage_name, x):
+        if stage_name not in self.polar_moe_modules:
+            return x
+        return self.polar_moe_modules[stage_name](x)
 
     def _fuse_skip(self, stage_name, x_dec, x_skip, x_skip_ref=None):
         if stage_name in self.rmsa_modules:
@@ -680,6 +592,7 @@ class NAFNet(nn.Module):
                 enc_skip_ref = None
             x = self._fuse_skip(stage_name, x, enc_skip, x_skip_ref=enc_skip_ref)
             x = decoder(x)
+            x = self._apply_polar_moe(stage_name, x)
             x = decoder_mce(x)
             x = self._apply_dfpb(stage_name, x)
             x = self._apply_fftdfpb(stage_name, x)
